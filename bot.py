@@ -8,7 +8,7 @@ import random
 from dotenv import load_dotenv
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
-
+# yo wow, dm me if u see ts
 STARTING_TROOPS = 500
 STARTING_TROOP_CAP = 5000
 TROOP_REGEN_PER_TICK = 300
