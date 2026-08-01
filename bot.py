@@ -127,7 +127,7 @@ async def joingame(interaction: discord.Interaction):
     if existing is not None:
         if existing.get("eliminated"):
             await interaction.response.send_message(
-                "You were eliminated in a previous game and can't rejoin lmao.", ephemeral=True
+                "You were eliminated so can't rejoin lmao.", ephemeral=True
             )
         else:
             await interaction.response.send_message("You've already joined the game bro", ephemeral=True)
@@ -140,12 +140,12 @@ async def joingame(interaction: discord.Interaction):
 
 
 def make_hub_embed(member, player):
-    embed = discord.Embed(title=f"{member.display_name}'s Empire", color=discord.Color.gold())
+    embed = discord.Embed(title=f"{member.display_name}'s land", color=discord.Color.gold())
     embed.add_field(name="Troops", value=f"{player['troops']:,} / {player['troop_cap']:,}", inline=True)
     embed.add_field(name="Gold", value=f"{player['gold']:,}", inline=True)
     embed.add_field(name="Cities", value=str(player["cities"]), inline=True)
     embed.add_field(name="Gold per tick", value=str(gold_regen_for(player)), inline=True)
-    embed.set_footer(text=f"Ticks happen every {TICK_MINUTES} minutes of real time.")
+    embed.set_footer(text=f" Regeneration happens every {TICK_MINUTES} minutes irl.")
     return embed
 
 
@@ -165,7 +165,7 @@ class GameHubView(discord.ui.View):
     async def build_city(self, interaction: discord.Interaction, button: discord.ui.Button):
         player = get_player(self.guild_id, self.user_id)
         if not is_active_player(player):
-            await interaction.response.send_message("You can't do that right now.", ephemeral=True)
+            await interaction.response.send_message("You can't do that rn.", ephemeral=True)
             return
         if player["gold"] < CITY_GOLD_COST:
             await interaction.response.send_message(
@@ -183,13 +183,13 @@ class GameHubView(discord.ui.View):
     async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
         player = get_player(self.guild_id, self.user_id)
         if not is_active_player(player):
-            await interaction.response.send_message("You can't do that right now.", ephemeral=True)
+            await interaction.response.send_message("You can't do that rn.", ephemeral=True)
             return
         embed = make_hub_embed(interaction.user, player)
         await interaction.response.edit_message(embed=embed, view=self)
 
 
-@bot.tree.command(name="gamehub", description="View and manage your lands")
+@bot.tree.command(name="gamehub", description="manage your lands")
 async def gamehub(interaction: discord.Interaction):
     player = get_player(interaction.guild_id, interaction.user.id)
     if not is_active_player(player):
@@ -301,7 +301,7 @@ class AttackView(discord.ui.View):
                 f"Structures lost: {1 if captured_city else 0}",
             ]
             if eliminated:
-                dm_lines.append("You have been eliminated and can no longer rejoin this game.")
+                dm_lines.append("You have been eliminated u cant rejoin this game.")
             await self.defender_member.send("\n".join(dm_lines))
         except (discord.Forbidden, discord.HTTPException):
             dm_sent = False
@@ -311,9 +311,9 @@ class AttackView(discord.ui.View):
             f"They lost {troop_loss:,} troops."
         ]
         if not dm_sent:
-            result_lines.append("⚠️ Couldn't DM them (their privacy settings may be blocking it) — they won't know unless you tell them.")
+            result_lines.append("⚠️ Couldn't DM them (their settings are blocking it) they won't know unless you tell them hehe.")
         if captured_city:
-            result_lines.append("You captured one of their cities!")
+            result_lines.append("You captured one of their cities W attack gng")
         if eliminated:
             result_lines.append(f"{self.defender_member.display_name} has been eliminated!")
 
@@ -321,7 +321,7 @@ class AttackView(discord.ui.View):
 
 
 @bot.tree.command(name="attack", description="Attack another player")
-@discord.app_commands.describe(target="Who do you want to attack?")
+@discord.app_commands.describe(target="Who to attack?")
 async def attack(interaction: discord.Interaction, target: discord.Member):
     attacker = get_player(interaction.guild_id, interaction.user.id)
     if not is_active_player(attacker):
@@ -349,7 +349,7 @@ async def attack(interaction: discord.Interaction, target: discord.Member):
     view = AttackView(interaction.guild_id, interaction.user, target, attacker["troops"])
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
-@bot.tree.command(name="adminrevive", description="[Admin] Revive an eliminated player back to a fresh start")
+@bot.tree.command(name="adminrevive", description="(Admins) Revive player back")
 @discord.app_commands.checks.has_permissions(manage_guild=True)
 async def adminrevive(interaction: discord.Interaction, target: discord.Member):
     player = get_player(interaction.guild_id, target.id)
