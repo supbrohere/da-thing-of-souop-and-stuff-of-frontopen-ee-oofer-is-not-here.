@@ -11,7 +11,8 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 
 STARTING_TROOPS = 500
 STARTING_TROOP_CAP = 5000
-TROOP_REGEN_PER_TICK = 50
+TROOP_REGEN_FLOOR = 1.1
+TROOP_REGEN_MULTIPLIER = 1.0
 CITY_TROOP_CAP_BONUS = 1000
 CITY_GOLD_COST = 500
 BASE_GOLD_REGEN = 15
@@ -91,6 +92,15 @@ def create_player(guild_id, user_id):
 
 def gold_regen_for(player):
     return BASE_GOLD_REGEN + (player["cities"] * GOLD_REGEN_PER_CITY)
+
+
+def calculate_troop_regen(current_troops, troop_cap):
+    if troop_cap <= 0 or current_troops >= troop_cap:
+        return 0
+    raw = (10 + (current_troops ** 0.73) / 4) * (1 - current_troops / troop_cap)
+    return max(TROOP_REGEN_FLOOR, raw) * TROOP_REGEN_MULTIPLIER
+
+
 def prune_alliances(player, now=None):
     if now is None:
         now = time.time()
@@ -133,7 +143,13 @@ def process_ticks(now=None):
         for user_id, player in guild_data["players"].items():
             if player.get("eliminated"):
                 continue
-            player["troops"] = min(player["troops"] + TROOP_REGEN_PER_TICK * ticks_passed, player["troop_cap"])
+            troops = player["troops"]
+            cap = player["troop_cap"]
+            for _ in range(ticks_passed):
+                if troops >= cap:
+                    break
+                troops = min(troops + round(calculate_troop_regen(troops, cap)), cap)
+            player["troops"] = troops
             player["gold"] += gold_regen_for(player) * ticks_passed
     data["last_tick"] += ticks_passed * TICK_SECONDS
     save_data(data)
@@ -469,7 +485,7 @@ async def leaderboard(interaction: discord.Interaction):
     sorted_players = sorted(players.items(), key=lambda item: item[1]["troops"], reverse=True)
 
     lines = []
-    medals = ["🥇", "🥈", "🥉"]
+    medals = ["🏆", "🥈", "🥉"]
     for i, (user_id, pdata) in enumerate(sorted_players):
         rank_icon = medals[i] if i < 3 else f"#{i+1}"
         member = interaction.guild.get_member(int(user_id))
@@ -512,7 +528,7 @@ class AttackView(discord.ui.View):
             return False
         return True
 
-async def resolve_attack(self, interaction: discord.Interaction, percent):
+    async def resolve_attack(self, interaction: discord.Interaction, percent):
         attacker = get_player(self.guild_id, self.attacker_member.id)
         defender = get_player(self.guild_id, self.defender_member.id)
 
@@ -588,6 +604,49 @@ async def resolve_attack(self, interaction: discord.Interaction, percent):
             result_lines.append(f"{self.defender_member.display_name} has been eliminated!")
 
         await interaction.response.edit_message(content="\n".join(result_lines), embed=None, view=None)
+class BetrayConfirmView(discord.ui.View):
+    def __init__(self, guild_id, attacker_member, defender_member):
+        super().__init__(timeout=60)
+        self.guild_id = guild_id
+        self.attacker_member = attacker_member
+        self.defender_member = defender_member
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.attacker_member.id:
+            await interaction.response.send_message("This isn't your confirmation menu.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Betray & Attack", style=discord.ButtonStyle.danger, emoji="🗡")
+    async def betray_and_attack(self, interaction: discord.Interaction, button: discord.ui.Button):
+        attacker = get_player(self.guild_id, self.attacker_member.id)
+        defender = get_player(self.guild_id, self.defender_member.id)
+        if not is_active_player(attacker) or not is_active_player(defender):
+            await interaction.response.edit_message(content="One of the players is no longer available.", embed=None, view=None)
+            return
+
+        break_alliance(self.guild_id, self.attacker_member.id, self.defender_member.id)
+        attacker["betrayer_until"] = time.time() + BETRAYAL_DURATION_SECONDS
+        save_data(data)
+
+        embed = discord.Embed(
+            title=f"Attack {self.defender_member.display_name}?",
+            description="Choose how many troops to commit to this attack.",
+            color=discord.Color.red()
+        )
+        embed.add_field(name="Your troops", value=f"{attacker['troops']:,}", inline=True)
+        embed.add_field(name=f"{self.defender_member.display_name}'s troops", value=f"{defender['troops']:,}", inline=True)
+
+        attack_view = AttackView(self.guild_id, self.attacker_member, self.defender_member, attacker["troops"])
+        await interaction.response.edit_message(
+            content=f"You betrayed your alliance with {self.defender_member.display_name}!",
+            embed=embed,
+            view=attack_view
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.grey)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="Attack cancelled.", embed=None, view=None)
 
 @bot.tree.command(name="attack", description="Attack another player")
 @discord.app_commands.describe(target="Who to attack?")
