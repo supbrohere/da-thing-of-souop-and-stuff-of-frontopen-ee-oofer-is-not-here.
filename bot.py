@@ -14,9 +14,12 @@ STARTING_TROOP_CAP = 5000
 TROOP_REGEN_FLOOR = 1.1
 TROOP_REGEN_MULTIPLIER = 1.0
 CITY_TROOP_CAP_BONUS = 1000
-CITY_GOLD_COST = 500
-BASE_GOLD_REGEN = 15
+CITY_PRICES = [250, 500, 500, 750, 1000, 1000, 1500, 1500, 2000, 2000, 2000, 5000]
+BASE_GOLD_REGEN = 20
 GOLD_REGEN_PER_CITY = 5
+PORT_PRICES = [500, 750, 1000, 1000, 1500, 1500, 2000, 2000, 2000, 5000]
+PORT_GOLD_REGEN_PER_PORT = 20
+PORT_ALLIANCE_BONUS_PERCENT = 20
 TICK_MINUTES = 5
 TICK_SECONDS = TICK_MINUTES * 60
 
@@ -64,6 +67,12 @@ def get_guild_players(guild_id):
         data["guilds"][gid] = {"players": {}}
     return data["guilds"][gid]["players"]
 
+def get_guild_dict(guild_id):
+    gid = str(guild_id)
+    if gid not in data["guilds"]:
+        data["guilds"][gid] = {"players": {}}
+    return data["guilds"][gid]
+
 
 def get_player(guild_id, user_id):
     players = get_guild_players(guild_id)
@@ -82,6 +91,7 @@ def create_player(guild_id, user_id):
         "troop_cap": STARTING_TROOP_CAP,
         "gold": 0,
         "cities": 0,
+        "ports": 0,
 "eliminated": False,
         "alliances": {},
         "betrayer_until": 0
@@ -90,9 +100,48 @@ def create_player(guild_id, user_id):
     return players[uid]
 
 
-def gold_regen_for(player):
-    return BASE_GOLD_REGEN + (player["cities"] * GOLD_REGEN_PER_CITY)
+def active_alliance_count(player, now=None):
+    """Counts alliances that haven't expired yet, without mutating the player dict."""
+    if now is None:
+        now = time.time()
+    alliances = player.get("alliances", {})
+    return sum(1 for expiry in alliances.values() if expiry > now)
 
+
+def port_earnings_per_port(player, now=None):
+    """Gold/tick a single port earns. Base 20, +20% per active alliance.
+    (0 alliances=20/100%, 1=24/120%, 2=28/140%, 3=32/160%, ...)
+    Uses integer math throughout so this always lands on a whole number."""
+    n = active_alliance_count(player, now)
+    percent = 100 + (PORT_ALLIANCE_BONUS_PERCENT * n)
+    return (PORT_GOLD_REGEN_PER_PORT * percent) // 100
+
+
+def port_gold_regen_for(player, now=None):
+    ports = player.get("ports", 0)
+    if ports <= 0:
+        return 0
+    return ports * port_earnings_per_port(player, now)
+
+
+def gold_regen_for(player, now=None):
+    base = BASE_GOLD_REGEN + (player["cities"] * GOLD_REGEN_PER_CITY)
+    return base + port_gold_regen_for(player, now)
+
+
+def get_city_price(current_cities):
+    """Price for your NEXT city, based on how many you already own. Past the
+    preset list, price just stays at the last value forever (no more scaling)."""
+    if current_cities < len(CITY_PRICES):
+        return CITY_PRICES[current_cities]
+    return CITY_PRICES[-1]
+
+
+def get_port_price(current_ports):
+    """Same idea as get_city_price, just for ports."""
+    if current_ports < len(PORT_PRICES):
+        return PORT_PRICES[current_ports]
+    return PORT_PRICES[-1]
 
 def calculate_troop_regen(current_troops, troop_cap):
     if troop_cap <= 0 or current_troops >= troop_cap:
@@ -161,6 +210,30 @@ async def tick_checker():
     process_ticks()
 
 
+def make_status_embed():
+    embed = discord.Embed(
+        description="🟢🟢🟢 **bot is online yay** 🟢🟢🟢",
+        color=discord.Color.green()
+    )
+    embed.set_footer(text="A new message like this posts every 5 min. If they stop appearing the bot is offline rip.")
+    return embed
+
+
+@tasks.loop(minutes=5)
+async def status_updater():
+    for guild_id, guild_data in data["guilds"].items():
+        channel_id = guild_data.get("status_channel_id")
+        if not channel_id:
+            continue
+        channel = bot.get_channel(int(channel_id))
+        if channel is None:
+            continue
+        try:
+            await channel.send(embed=make_status_embed())
+        except (discord.Forbidden, discord.HTTPException):
+            continue
+
+
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
@@ -171,6 +244,8 @@ async def on_ready():
         print(f"Error syncing commands: {e}")
     if not tick_checker.is_running():
         tick_checker.start()
+    if not status_updater.is_running():
+        status_updater.start()
 
 
 @bot.tree.command(name="joingame", description="Join da game")
@@ -190,12 +265,39 @@ async def joingame(interaction: discord.Interaction):
         f"{STARTING_TROOPS} troops (cap {STARTING_TROOP_CAP}) and 0 gold."
     )
 
+@bot.tree.command(name="help", description="How to use the bot")
+async def help_command(interaction: discord.Interaction):
+    embed = discord.Embed(title="How to use", description="""This is a tutorial written by me (Supbro), this tutorial will be updated every time something new happens. 
+
+So, this bot is based off of openfront.io that is the main reason I built da bot. Do /joingame to join the leaderboard and get access to every other game command. It will start you off with a troop cap of 5000. You can’t really do much at the start and you have to wait for yourself to generate enough gold to buy either a city or a port in /gamehub. Cities increase your troop cap and generate you a little more gold per tick. Ports are different, they increase your base gold gain by 20 per port, however, every alliance you get it adds 20% on top of the base 20 per port. for example, if I have one alliance that means 100% (20) + 20% of 20, that means you get 24 gold per port, that might not seem like a lot, but if you have a lot of ports then it stacks up quick. 
+
+The attacking system is pretty simple, you do /attack, then select a player, after that you can choose from 15% 30%, 50% 75% and all in (100%) for your attacks. When you attack someone it will give the person you attacked a DM message saying that they have been attacked with amount of troops and they lost amount of troops. Attacking people also gives you a chance to destroy a structure. If you have no structures and no troops, then you eliminated, currently there isn’t a way to be revived so you just have to ping an admin. Attacking people also need some luck because the defender can lose up to 120% of the amount relative to the attacker’s troops that they sent, or as low as 60% relative to the attacker’s troops that they sent. The attacker on the other hand can lose up to 100% of their troops, or as low as 70% (the percentages can change, depending on how updated this tutorial is.)
+
+Do /leaderboard to see other people, it is ordered by how much troops they currently have. 
+Do /gamehub to manage your land or view other people land
+Do /attack to attack other people
+Do /joingame to join da game
+
+If you have any other questions, feel free to ping the Admins (if you are not in the MOON server then don’t ping the admin because they probably don’t know much about the bot, no disrespect)""", color=discord.Color.gold())
+    await interaction.response.send_message(embed=embed)
+
 
 def make_hub_embed(member, player):
     embed = discord.Embed(title=f"{member.display_name}'s land", color=discord.Color.gold())
     embed.add_field(name="Troops", value=f"{player['troops']:,} / {player['troop_cap']:,}", inline=True)
     embed.add_field(name="Gold", value=f"{player['gold']:,}", inline=True)
     embed.add_field(name="Cities", value=str(player["cities"]), inline=True)
+
+    ports = player.get("ports", 0)
+    if ports > 0:
+        n = active_alliance_count(player)
+        percent = 100 + (PORT_ALLIANCE_BONUS_PERCENT * n)
+        per_port = port_earnings_per_port(player)
+        ports_value = f"{ports} ({percent}%)"
+    else:
+        ports_value = "0"
+    embed.add_field(name="Ports", value=ports_value, inline=True)
+
     embed.add_field(name="Gold per tick", value=str(gold_regen_for(player)), inline=True)
     embed.set_footer(text=f" Regeneration/tick happens every {TICK_MINUTES} minutes irl.")
     return embed
@@ -217,7 +319,7 @@ class BetraySelectView(discord.ui.View):
         alliances = prune_alliances(player)
         if str(target.id) not in alliances:
             await interaction.response.edit_message(
-                content=f"You're not allied with {target.display_name}, so you can't betray them.",
+                content=f"You're not allied with {target.display_name}, so u can't betray them.",
                 view=None
             )
             return
@@ -354,7 +456,7 @@ class PickAllyView(discord.ui.View):
         self.guild_id = guild_id
         self.user_id = user_id
 
-    @discord.ui.select(cls=discord.ui.UserSelect, placeholder="Choose a player to ally with", min_values=1, max_values=1)
+    @discord.ui.select(cls=discord.ui.UserSelect, placeholder="Choose a player to ally up", min_values=1, max_values=1)
     async def pick_target(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
         target = select.values[0]
         if target.id == self.user_id:
@@ -400,41 +502,68 @@ class GameHubView(discord.ui.View):
         self.guild_id = guild_id
         self.user_id = user_id
 
+        player = get_player(guild_id, user_id)
+        city_count = player["cities"] if player else 0
+        port_count = player.get("ports", 0) if player else 0
+        city_price = get_city_price(city_count)
+        port_price = get_port_price(port_count)
+
+        city_btn = discord.ui.Button(label=f"Build City ({city_price:,} gold)", style=discord.ButtonStyle.green, emoji="🏙")
+        city_btn.callback = self.build_city
+        self.add_item(city_btn)
+
+        port_btn = discord.ui.Button(label=f"Build Port ({port_price:,} gold)", style=discord.ButtonStyle.green, emoji="⚓")
+        port_btn.callback = self.build_port
+        self.add_item(port_btn)
+
+        alliance_btn = discord.ui.Button(label="Alliance", style=discord.ButtonStyle.blurple, emoji="🤝")
+        alliance_btn.callback = self.alliance
+        self.add_item(alliance_btn)
+
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.user_id:
             await interaction.response.send_message("This isn't your hub lil bro.", ephemeral=True)
             return False
         return True
 
-    @discord.ui.button(label="Build City (500 gold)", style=discord.ButtonStyle.green, emoji="🏙")
-    async def build_city(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def build_city(self, interaction: discord.Interaction):
         player = get_player(self.guild_id, self.user_id)
         if not is_active_player(player):
             await interaction.response.send_message("You can't do that rn.", ephemeral=True)
             return
-        if player["gold"] < CITY_GOLD_COST:
+        price = get_city_price(player["cities"])
+        if player["gold"] < price:
             await interaction.response.send_message(
-                f"Not enough gold. You need {CITY_GOLD_COST}, you have {player['gold']}.", ephemeral=True
+                f"Not enough gold. You need {price:,}, you have {player['gold']:,}.", ephemeral=True
             )
             return
-        player["gold"] -= CITY_GOLD_COST
+        player["gold"] -= price
         player["cities"] += 1
         player["troop_cap"] += CITY_TROOP_CAP_BONUS
         save_data(data)
         embed = make_hub_embed(interaction.user, player)
-        await interaction.response.edit_message(embed=embed, view=self)
+        new_view = GameHubView(self.guild_id, self.user_id)
+        await interaction.response.edit_message(embed=embed, view=new_view)
 
-    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.grey, emoji="🔄")
-    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def build_port(self, interaction: discord.Interaction):
         player = get_player(self.guild_id, self.user_id)
         if not is_active_player(player):
             await interaction.response.send_message("You can't do that rn.", ephemeral=True)
             return
+        price = get_port_price(player.get("ports", 0))
+        if player["gold"] < price:
+            await interaction.response.send_message(
+                f"Not enough gold. You need {price:,}, you have {player['gold']:,}.", ephemeral=True
+            )
+            return
+        player["gold"] -= price
+        player["ports"] = player.get("ports", 0) + 1
+        save_data(data)
         embed = make_hub_embed(interaction.user, player)
-        await interaction.response.edit_message(embed=embed, view=self)
+        new_view = GameHubView(self.guild_id, self.user_id)
+        await interaction.response.edit_message(embed=embed, view=new_view)
 
-    @discord.ui.button(label="Alliance", style=discord.ButtonStyle.blurple, emoji="🤝")
-    async def alliance(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def alliance(self, interaction: discord.Interaction):
         player = get_player(self.guild_id, self.user_id)
         if not is_active_player(player):
             await interaction.response.send_message("You can't do that rn.", ephemeral=True)
@@ -462,8 +591,20 @@ class GameHubView(discord.ui.View):
         view = AllianceHubView(self.guild_id, self.user_id, has_alliances)
         await interaction.response.send_message("\n".join(lines), view=view, ephemeral=True)
 
-@bot.tree.command(name="gamehub", description="manage your lands")
-async def gamehub(interaction: discord.Interaction):
+@bot.tree.command(name="gamehub", description="Manage your lands, or optionally view another player's stuff")
+@discord.app_commands.describe(member="Optional: view this player's hub instead of your own (read only)")
+async def gamehub(interaction: discord.Interaction, member: discord.Member = None):
+    if member is not None:
+        target_player = get_player(interaction.guild_id, member.id)
+        if not is_active_player(target_player):
+            await interaction.response.send_message(
+                f"{member.display_name} hasn't joined the game or has been eliminated.", ephemeral=True
+            )
+            return
+        embed = make_hub_embed(member, target_player)
+        await interaction.response.send_message(embed=embed)
+        return
+
     player = get_player(interaction.guild_id, interaction.user.id)
     if not is_active_player(player):
         await interaction.response.send_message(
@@ -479,7 +620,7 @@ async def gamehub(interaction: discord.Interaction):
 async def leaderboard(interaction: discord.Interaction):
     players = get_guild_players(interaction.guild_id)
     if not players:
-        await interaction.response.send_message("No one has joined the game yet.", ephemeral=True)
+        await interaction.response.send_message("No one has joined the game yet. rip", ephemeral=True)
         return
 
     sorted_players = sorted(players.items(), key=lambda item: item[1]["troops"], reverse=True)
@@ -577,8 +718,8 @@ class AttackView(discord.ui.View):
         dm_sent = True
         try:
             dm_embed = discord.Embed(
-                title="⚔️ Empire Under Attack!",
-                description=f"**{self.attacker_member.display_name}** launched an assault on your empire.",
+                title="⚔️Ur Under Attack!⚔️",
+                description=f"**{self.attacker_member.display_name}** launched an invasion of your lands, Beat em up",
                 color=discord.Color.red()
             )
             dm_embed.add_field(name="🪖 Troops Sent Against You", value=f"{attack_troops:,}", inline=True)
@@ -586,7 +727,7 @@ class AttackView(discord.ui.View):
             dm_embed.add_field(name="🏙 Structures Lost", value=str(1 if captured_city else 0), inline=True)
             if eliminated:
                 dm_embed.add_field(name="💀 Status", value="You have been eliminated and can no longer rejoin.", inline=False)
-            dm_embed.set_footer(text="Empire Wars")
+            dm_embed.set_footer(text="do /attack to retaliate")
             await self.defender_member.send(embed=dm_embed)
         except (discord.Forbidden, discord.HTTPException):
             dm_sent = False
@@ -705,6 +846,7 @@ async def adminrevive(interaction: discord.Interaction, target: discord.Member):
     player["troop_cap"] = STARTING_TROOP_CAP
     player["gold"] = 0
     player["cities"] = 0
+    player["ports"] = 0
     player["eliminated"] = False
     save_data(data)
 
@@ -785,6 +927,26 @@ async def adminrestart(interaction: discord.Interaction):
 
 @adminrestart.error
 async def adminrestart_error(interaction: discord.Interaction, error):
+    if isinstance(error, discord.app_commands.MissingPermissions):
+        await interaction.response.send_message("❌ You need Manage Server permission to use this.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"⚠️ Something went wrong: {error}", ephemeral=True)
+
+
+@bot.tree.command(name="botstatus", description="(Admins) Set a channel to show a live bot online status that updates every 5 minutes")
+@discord.app_commands.describe(channel="Which channel should show the bot's status?")
+@discord.app_commands.checks.has_permissions(manage_guild=True)
+async def botstatus(interaction: discord.Interaction, channel: discord.TextChannel):
+    await channel.send(embed=make_status_embed())
+
+    guild_dict = get_guild_dict(interaction.guild_id)
+    guild_dict["status_channel_id"] = channel.id
+    save_data(data)
+
+    await interaction.response.send_message(f"✅ Status updates will now post in {channel.mention}.", ephemeral=True)
+
+@botstatus.error
+async def botstatus_error(interaction: discord.Interaction, error):
     if isinstance(error, discord.app_commands.MissingPermissions):
         await interaction.response.send_message("❌ You need Manage Server permission to use this.", ephemeral=True)
     else:
