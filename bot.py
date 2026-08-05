@@ -4,6 +4,8 @@ import json
 import os
 import time
 import random
+import asyncio
+import signal
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -13,11 +15,11 @@ STARTING_TROOPS = 500
 STARTING_TROOP_CAP = 5000
 TROOP_REGEN_FLOOR = 1.1
 TROOP_REGEN_MULTIPLIER = 1.0
-CITY_TROOP_CAP_BONUS = 1000
-CITY_PRICES = [250, 500, 500, 750, 1000, 1000, 1500, 1500, 2000, 2000, 2000, 5000]
+CITY_TROOP_CAP_BONUS = 1500
+CITY_PRICES = [250, 500, 500, 750, 1000, 1000, 1500, 1500, 2000, 2000, 2000, 5000, 5000, 5000, 5000, 5000, 7000, 7000, 7000, 7000, 10000]
 BASE_GOLD_REGEN = 20
 GOLD_REGEN_PER_CITY = 5
-PORT_PRICES = [500, 750, 1000, 1000, 1500, 1500, 2000, 2000, 2000, 5000]
+PORT_PRICES = [500, 750, 1000, 1000, 1500, 1500, 2000, 2000, 2000, 5000, 5000, 5000, 5000, 5000, 7500, 7500, 7500, 7500, 10000]
 PORT_GOLD_REGEN_PER_PORT = 20
 PORT_ALLIANCE_BONUS_PERCENT = 20
 TICK_MINUTES = 5
@@ -92,6 +94,7 @@ def create_player(guild_id, user_id):
         "gold": 0,
         "cities": 0,
         "ports": 0,
+        "grid": [{"cities": 0, "ports": 0} for _ in range(9)],
 "eliminated": False,
         "alliances": {},
         "betrayer_until": 0
@@ -142,6 +145,35 @@ def get_port_price(current_ports):
     if current_ports < len(PORT_PRICES):
         return PORT_PRICES[current_ports]
     return PORT_PRICES[-1]
+
+
+def ensure_grid(player):
+    """Players who joined before the grid system won't have a 'grid' key yet.
+    Give them one, stacking whatever cities/ports they already own into Stack 1
+    so nothing gets lost. Safe to call repeatedly — does nothing once it exists."""
+    grid = player.get("grid")
+    if isinstance(grid, list) and len(grid) == 9:
+        return grid
+    grid = [{"cities": 0, "ports": 0} for _ in range(9)]
+    grid[0]["cities"] = player.get("cities", 0)
+    grid[0]["ports"] = player.get("ports", 0)
+    player["grid"] = grid
+    return grid
+
+
+def transfer_structure_box(attacker, defender, structure_key):
+    """Moves one captured structure ('cities' or 'ports') out of whichever stack
+    the defender has one in, into that SAME stack number on the attacker's grid."""
+    ensure_grid(attacker)
+    ensure_grid(defender)
+    for idx in range(9):
+        if defender["grid"][idx][structure_key] > 0:
+            defender["grid"][idx][structure_key] -= 1
+            attacker["grid"][idx][structure_key] += 1
+            return
+    # Fallback (shouldn't normally happen): totals said there was one to take,
+    # but no stack shows it. Don't lose the structure, just seed Stack 1.
+    attacker["grid"][0][structure_key] += 1
 
 def calculate_troop_regen(current_troops, troop_cap):
     if troop_cap <= 0 or current_troops >= troop_cap:
@@ -210,17 +242,25 @@ async def tick_checker():
     process_ticks()
 
 
-def make_status_embed():
-    embed = discord.Embed(
-        description="🟢🟢🟢 **bot is online yay** 🟢🟢🟢",
-        color=discord.Color.green()
-    )
-    embed.set_footer(text="A new message like this posts every 5 min. If they stop appearing the bot is offline rip.")
+def make_status_embed(online=True):
+    if online:
+        embed = discord.Embed(
+            description="🟢🟢🟢 **bot is online yay** 🟢🟢🟢",
+            color=discord.Color.green()
+        )
+        embed.set_footer(text="This message updates itself now :)")
+    else:
+        embed = discord.Embed(
+            description="🔴🔴🔴 **bot is offline rip** 🔴🔴🔴",
+            color=discord.Color.red()
+        )
+        embed.set_footer(text="if the bot ever crashes or loses power it'll still say online.")
     return embed
 
 
-@tasks.loop(minutes=5)
-async def status_updater():
+async def set_status_all_guilds(online):
+    """Edits each server's saved status message. If the message got deleted (or there
+    isn't one yet), sends a fresh one and remembers its ID for next time."""
     for guild_id, guild_data in data["guilds"].items():
         channel_id = guild_data.get("status_channel_id")
         if not channel_id:
@@ -228,10 +268,50 @@ async def status_updater():
         channel = bot.get_channel(int(channel_id))
         if channel is None:
             continue
+
+        message = None
+        message_id = guild_data.get("status_message_id")
+        if message_id:
+            try:
+                message = await channel.fetch_message(int(message_id))
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                message = None
+
         try:
-            await channel.send(embed=make_status_embed())
+            if message is not None:
+                await message.edit(embed=make_status_embed(online))
+            else:
+                new_message = await channel.send(embed=make_status_embed(online))
+                guild_data["status_message_id"] = new_message.id
+                save_data(data)
         except (discord.Forbidden, discord.HTTPException):
             continue
+
+
+async def shutdown_and_exit():
+    """Runs on a clean Ctrl+C / stop signal: flips status messages to offline, then closes the bot."""
+    print("Shutting down, updating status message(s)...")
+    try:
+        await set_status_all_guilds(False)
+    except Exception as e:
+        print(f"Couldn't update status on shutdown: {e}")
+    await bot.close()
+
+
+def _handle_stop_signal(sig, frame):
+    loop = getattr(bot, "loop", None)
+    if loop and loop.is_running():
+        loop.call_soon_threadsafe(lambda: asyncio.ensure_future(shutdown_and_exit()))
+    else:
+        # Bot never finished connecting — nothing online to flip offline, just exit normally.
+        raise KeyboardInterrupt
+
+
+signal.signal(signal.SIGINT, _handle_stop_signal)
+try:
+    signal.signal(signal.SIGTERM, _handle_stop_signal)
+except (AttributeError, ValueError):
+    pass  # not every platform supports binding SIGTERM, that's fine
 
 
 @bot.event
@@ -244,8 +324,7 @@ async def on_ready():
         print(f"Error syncing commands: {e}")
     if not tick_checker.is_running():
         tick_checker.start()
-    if not status_updater.is_running():
-        status_updater.start()
+    await set_status_all_guilds(True)
 
 
 @bot.tree.command(name="joingame", description="Join da game")
@@ -300,6 +379,26 @@ def make_hub_embed(member, player):
 
     embed.add_field(name="Gold per tick", value=str(gold_regen_for(player)), inline=True)
     embed.set_footer(text=f" Regeneration/tick happens every {TICK_MINUTES} minutes irl.")
+    return embed
+
+
+def make_grid_embed(member, player, editable=True):
+    ensure_grid(player)
+    embed = discord.Embed(
+        title=f"{member.display_name}'s Building Stacks",
+        color=discord.Color.gold()
+    )
+    for idx in range(9):
+        box = player["grid"][idx]
+        embed.add_field(
+            name=f"Stack {idx + 1}",
+            value=f"🏙 Cities: {box['cities']}\n⚓ Ports: {box['ports']}",
+            inline=True
+        )
+    embed.add_field(name="Total Cities", value=str(player["cities"]), inline=True)
+    embed.add_field(name="Total Ports", value=str(player.get("ports", 0)), inline=True)
+    if editable:
+        embed.set_footer(text="Pick a building type below, then pick a stack to place it in.")
     return embed
 
 class BetraySelectView(discord.ui.View):
@@ -502,19 +601,9 @@ class GameHubView(discord.ui.View):
         self.guild_id = guild_id
         self.user_id = user_id
 
-        player = get_player(guild_id, user_id)
-        city_count = player["cities"] if player else 0
-        port_count = player.get("ports", 0) if player else 0
-        city_price = get_city_price(city_count)
-        port_price = get_port_price(port_count)
-
-        city_btn = discord.ui.Button(label=f"Build City ({city_price:,} gold)", style=discord.ButtonStyle.green, emoji="🏙")
-        city_btn.callback = self.build_city
-        self.add_item(city_btn)
-
-        port_btn = discord.ui.Button(label=f"Build Port ({port_price:,} gold)", style=discord.ButtonStyle.green, emoji="⚓")
-        port_btn.callback = self.build_port
-        self.add_item(port_btn)
+        build_btn = discord.ui.Button(label="Build", style=discord.ButtonStyle.green, emoji="🏗")
+        build_btn.callback = self.build
+        self.add_item(build_btn)
 
         alliance_btn = discord.ui.Button(label="Alliance", style=discord.ButtonStyle.blurple, emoji="🤝")
         alliance_btn.callback = self.alliance
@@ -526,42 +615,16 @@ class GameHubView(discord.ui.View):
             return False
         return True
 
-    async def build_city(self, interaction: discord.Interaction):
+    async def build(self, interaction: discord.Interaction):
         player = get_player(self.guild_id, self.user_id)
         if not is_active_player(player):
             await interaction.response.send_message("You can't do that rn.", ephemeral=True)
             return
-        price = get_city_price(player["cities"])
-        if player["gold"] < price:
-            await interaction.response.send_message(
-                f"Not enough gold. You need {price:,}, you have {player['gold']:,}.", ephemeral=True
-            )
-            return
-        player["gold"] -= price
-        player["cities"] += 1
-        player["troop_cap"] += CITY_TROOP_CAP_BONUS
+        ensure_grid(player)
         save_data(data)
-        embed = make_hub_embed(interaction.user, player)
-        new_view = GameHubView(self.guild_id, self.user_id)
-        await interaction.response.edit_message(embed=embed, view=new_view)
-
-    async def build_port(self, interaction: discord.Interaction):
-        player = get_player(self.guild_id, self.user_id)
-        if not is_active_player(player):
-            await interaction.response.send_message("You can't do that rn.", ephemeral=True)
-            return
-        price = get_port_price(player.get("ports", 0))
-        if player["gold"] < price:
-            await interaction.response.send_message(
-                f"Not enough gold. You need {price:,}, you have {player['gold']:,}.", ephemeral=True
-            )
-            return
-        player["gold"] -= price
-        player["ports"] = player.get("ports", 0) + 1
-        save_data(data)
-        embed = make_hub_embed(interaction.user, player)
-        new_view = GameHubView(self.guild_id, self.user_id)
-        await interaction.response.edit_message(embed=embed, view=new_view)
+        embed = make_grid_embed(interaction.user, player, editable=True)
+        view = GridBuildView(self.guild_id, self.user_id)
+        await interaction.response.edit_message(embed=embed, view=view)
 
     async def alliance(self, interaction: discord.Interaction):
         player = get_player(self.guild_id, self.user_id)
@@ -591,6 +654,168 @@ class GameHubView(discord.ui.View):
         view = AllianceHubView(self.guild_id, self.user_id, has_alliances)
         await interaction.response.send_message("\n".join(lines), view=view, ephemeral=True)
 
+class GridBuildView(discord.ui.View):
+    """Shown after clicking Build on your own hub — the 3x3 grid plus buttons
+    to build a city, build a port, or go back."""
+    def __init__(self, guild_id, user_id):
+        super().__init__(timeout=180)
+        self.guild_id = guild_id
+        self.user_id = user_id
+
+        player = get_player(guild_id, user_id)
+        city_price = get_city_price(player["cities"]) if player else 0
+        port_price = get_port_price(player.get("ports", 0)) if player else 0
+
+        city_btn = discord.ui.Button(label=f"Build City ({city_price:,} gold)", style=discord.ButtonStyle.green, emoji="🏙")
+        city_btn.callback = self.pick_city_spot
+        self.add_item(city_btn)
+
+        port_btn = discord.ui.Button(label=f"Build Port ({port_price:,} gold)", style=discord.ButtonStyle.green, emoji="⚓")
+        port_btn.callback = self.pick_port_spot
+        self.add_item(port_btn)
+
+        back_btn = discord.ui.Button(label="Back to Hub", style=discord.ButtonStyle.grey)
+        back_btn.callback = self.back_to_hub
+        self.add_item(back_btn)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your hub lil bro.", ephemeral=True)
+            return False
+        return True
+
+    async def pick_city_spot(self, interaction: discord.Interaction):
+        await self._open_position_picker(interaction, "cities", "city")
+
+    async def pick_port_spot(self, interaction: discord.Interaction):
+        await self._open_position_picker(interaction, "ports", "port")
+
+    async def _open_position_picker(self, interaction: discord.Interaction, structure_key, label):
+        player = get_player(self.guild_id, self.user_id)
+        if not is_active_player(player):
+            await interaction.response.send_message("You can't do that rn.", ephemeral=True)
+            return
+        ensure_grid(player)
+        embed = make_grid_embed(interaction.user, player, editable=True)
+        embed.description = f"Pick a stack to build your {label} in."
+        view = BuildPositionView(self.guild_id, self.user_id, structure_key)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    async def back_to_hub(self, interaction: discord.Interaction):
+        player = get_player(self.guild_id, self.user_id)
+        if not is_active_player(player):
+            await interaction.response.edit_message(content="You can't do that rn.", embed=None, view=None)
+            return
+        embed = make_hub_embed(interaction.user, player)
+        view = GameHubView(self.guild_id, self.user_id)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+
+class BuildPositionView(discord.ui.View):
+    """The 9 stack-picker buttons (left-to-right, top-to-bottom), plus Cancel."""
+    def __init__(self, guild_id, user_id, structure_key):
+        super().__init__(timeout=120)
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.structure_key = structure_key  # "cities" or "ports"
+
+        for idx in range(9):
+            btn = discord.ui.Button(label=str(idx + 1), style=discord.ButtonStyle.blurple, row=idx // 3)
+            btn.callback = self._make_callback(idx)
+            self.add_item(btn)
+
+        cancel_btn = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.grey, row=3)
+        cancel_btn.callback = self.cancel
+        self.add_item(cancel_btn)
+
+    def _make_callback(self, idx):
+        async def callback(interaction: discord.Interaction):
+            await self.build_at(interaction, idx)
+        return callback
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your hub lil bro.", ephemeral=True)
+            return False
+        return True
+
+    async def build_at(self, interaction: discord.Interaction, idx):
+        player = get_player(self.guild_id, self.user_id)
+        if not is_active_player(player):
+            await interaction.response.send_message("You can't do that rn.", ephemeral=True)
+            return
+        ensure_grid(player)
+
+        if self.structure_key == "cities":
+            price = get_city_price(player["cities"])
+        else:
+            price = get_port_price(player.get("ports", 0))
+
+        if player["gold"] < price:
+            await interaction.response.send_message(
+                f"Not enough gold. You need {price:,}, you have {player['gold']:,}.", ephemeral=True
+            )
+            return
+
+        player["gold"] -= price
+        player["grid"][idx][self.structure_key] += 1
+        player[self.structure_key] = player.get(self.structure_key, 0) + 1
+        if self.structure_key == "cities":
+            player["troop_cap"] += CITY_TROOP_CAP_BONUS
+        save_data(data)
+
+        embed = make_grid_embed(interaction.user, player, editable=True)
+        view = GridBuildView(self.guild_id, self.user_id)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    async def cancel(self, interaction: discord.Interaction):
+        player = get_player(self.guild_id, self.user_id)
+        if not is_active_player(player):
+            await interaction.response.edit_message(content="You can't do that rn.", embed=None, view=None)
+            return
+        embed = make_grid_embed(interaction.user, player, editable=True)
+        view = GridBuildView(self.guild_id, self.user_id)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+
+class PublicGridView(discord.ui.View):
+    """Read-only grid view for someone else's hub — just a Back button."""
+    def __init__(self, guild_id, member: discord.Member):
+        super().__init__(timeout=180)
+        self.guild_id = guild_id
+        self.member = member
+
+    @discord.ui.button(label="Back to Hub", style=discord.ButtonStyle.grey)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        player = get_player(self.guild_id, self.member.id)
+        if not is_active_player(player):
+            await interaction.response.edit_message(content=f"{self.member.display_name} is no longer active.", embed=None, view=None)
+            return
+        embed = make_hub_embed(self.member, player)
+        view = PublicHubView(self.guild_id, self.member)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+
+class PublicHubView(discord.ui.View):
+    """Shown under someone ELSE's hub — read only, just a View Grid button."""
+    def __init__(self, guild_id, member: discord.Member):
+        super().__init__(timeout=180)
+        self.guild_id = guild_id
+        self.member = member
+
+    @discord.ui.button(label="View Grid", style=discord.ButtonStyle.blurple, emoji="🗺")
+    async def view_grid(self, interaction: discord.Interaction, button: discord.ui.Button):
+        player = get_player(self.guild_id, self.member.id)
+        if not is_active_player(player):
+            await interaction.response.edit_message(content=f"{self.member.display_name} is no longer active.", embed=None, view=None)
+            return
+        ensure_grid(player)
+        save_data(data)
+        embed = make_grid_embed(self.member, player, editable=False)
+        view = PublicGridView(self.guild_id, self.member)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+
 @bot.tree.command(name="gamehub", description="Manage your lands, or optionally view another player's stuff")
 @discord.app_commands.describe(member="Optional: view this player's hub instead of your own (read only)")
 async def gamehub(interaction: discord.Interaction, member: discord.Member = None):
@@ -602,7 +827,8 @@ async def gamehub(interaction: discord.Interaction, member: discord.Member = Non
             )
             return
         embed = make_hub_embed(member, target_player)
-        await interaction.response.send_message(embed=embed)
+        view = PublicHubView(interaction.guild_id, member)
+        await interaction.response.send_message(embed=embed, view=view)
         return
 
     player = get_player(interaction.guild_id, interaction.user.id)
@@ -706,6 +932,7 @@ class AttackView(discord.ui.View):
             defender["troops"] = min(defender["troops"], defender["troop_cap"])
             attacker["cities"] += 1
             attacker["troop_cap"] += CITY_TROOP_CAP_BONUS
+            transfer_structure_box(attacker, defender, "cities")
 
         eliminated = False
         if defender["troops"] <= 0 and defender["cities"] <= 0:
@@ -847,6 +1074,7 @@ async def adminrevive(interaction: discord.Interaction, target: discord.Member):
     player["gold"] = 0
     player["cities"] = 0
     player["ports"] = 0
+    player["grid"] = [{"cities": 0, "ports": 0} for _ in range(9)]
     player["eliminated"] = False
     save_data(data)
 
@@ -933,17 +1161,18 @@ async def adminrestart_error(interaction: discord.Interaction, error):
         await interaction.response.send_message(f"⚠️ Something went wrong: {error}", ephemeral=True)
 
 
-@bot.tree.command(name="botstatus", description="(Admins) Set a channel to show a live bot online status that updates every 5 minutes")
+@bot.tree.command(name="botstatus", description="(Admins) Set a channel to show a live bot online/offline status")
 @discord.app_commands.describe(channel="Which channel should show the bot's status?")
 @discord.app_commands.checks.has_permissions(manage_guild=True)
 async def botstatus(interaction: discord.Interaction, channel: discord.TextChannel):
-    await channel.send(embed=make_status_embed())
+    message = await channel.send(embed=make_status_embed(True))
 
     guild_dict = get_guild_dict(interaction.guild_id)
     guild_dict["status_channel_id"] = channel.id
+    guild_dict["status_message_id"] = message.id
     save_data(data)
 
-    await interaction.response.send_message(f"✅ Status updates will now post in {channel.mention}.", ephemeral=True)
+    await interaction.response.send_message(f"✅ Status will now show in {channel.mention} and update itself on startup/shutdown.", ephemeral=True)
 
 @botstatus.error
 async def botstatus_error(interaction: discord.Interaction, error):
@@ -953,4 +1182,10 @@ async def botstatus_error(interaction: discord.Interaction, error):
         await interaction.response.send_message(f"⚠️ Something went wrong: {error}", ephemeral=True)
 
 
-bot.run(TOKEN)
+async def main():
+    async with bot:
+        await bot.start(TOKEN)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
