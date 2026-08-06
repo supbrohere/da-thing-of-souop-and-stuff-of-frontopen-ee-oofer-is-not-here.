@@ -22,6 +22,14 @@ GOLD_REGEN_PER_CITY = 5
 PORT_PRICES = [500, 750, 1000, 1000, 1500, 1500, 2000, 2000, 2000, 5000, 5000, 5000, 5000, 5000, 7500, 7500, 7500, 7500, 10000]
 PORT_GOLD_REGEN_PER_PORT = 20
 PORT_ALLIANCE_BONUS_PERCENT = 20
+STARTING_STACK_COUNT = 3
+MAX_STACK_COUNT = 6
+STACK_PRICES = [20000, 40000, 65000]
+SILO_PRICES = [9000, 15000, 20000, 25000, 35000, 50000, 50000, 50000, 100000]
+MISSILE_DESTROY_PERCENT = 0.50
+MISSILE_TYPES = {
+    "atom_bomb": {"label": "Atom Bomb", "emoji": "☢️", "price": 15000},
+}
 TICK_MINUTES = 5
 TICK_SECONDS = TICK_MINUTES * 60
 
@@ -34,12 +42,13 @@ HIGH_CAPTURE_CHANCE = 0.75
 ATTACK_PERCENT_OPTIONS = [0.15, 0.30, 0.50, 0.75, 1.0]
 ATTACK_PERCENT_LABELS = {0.15: "15%", 0.30: "30%", 0.50: "50%", 0.75: "75%", 1.0: "All In"}
 ALLIANCE_DURATION_OPTIONS_DAYS = [2, 3, 4, 5]
-BETRAYER_LOSS_MULTIPLIER = 1.5
+BETRAYER_LOSS_MULTIPLIER = 1.75
 BETRAYAL_DURATION_SECONDS = 12 * 3600
 DATA_FILE = "game_data.json"
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
@@ -94,7 +103,8 @@ def create_player(guild_id, user_id):
         "gold": 0,
         "cities": 0,
         "ports": 0,
-        "grid": [{"cities": 0, "ports": 0} for _ in range(9)],
+        "silos": 0,
+        "grid": [{"cities": 0, "ports": 0, "silo": 0, "missile": None} for _ in range(STARTING_STACK_COUNT)],
 "eliminated": False,
         "alliances": {},
         "betrayer_until": 0
@@ -104,7 +114,6 @@ def create_player(guild_id, user_id):
 
 
 def active_alliance_count(player, now=None):
-    """Counts alliances that haven't expired yet, without mutating the player dict."""
     if now is None:
         now = time.time()
     alliances = player.get("alliances", {})
@@ -112,9 +121,6 @@ def active_alliance_count(player, now=None):
 
 
 def port_earnings_per_port(player, now=None):
-    """Gold/tick a single port earns. Base 20, +20% per active alliance.
-    (0 alliances=20/100%, 1=24/120%, 2=28/140%, 3=32/160%, ...)
-    Uses integer math throughout so this always lands on a whole number."""
     n = active_alliance_count(player, now)
     percent = 100 + (PORT_ALLIANCE_BONUS_PERCENT * n)
     return (PORT_GOLD_REGEN_PER_PORT * percent) // 100
@@ -133,47 +139,93 @@ def gold_regen_for(player, now=None):
 
 
 def get_city_price(current_cities):
-    """Price for your NEXT city, based on how many you already own. Past the
-    preset list, price just stays at the last value forever (no more scaling)."""
     if current_cities < len(CITY_PRICES):
         return CITY_PRICES[current_cities]
     return CITY_PRICES[-1]
 
 
 def get_port_price(current_ports):
-    """Same idea as get_city_price, just for ports."""
     if current_ports < len(PORT_PRICES):
         return PORT_PRICES[current_ports]
     return PORT_PRICES[-1]
 
 
+def get_stack_price(current_stack_count):
+    idx = current_stack_count - STARTING_STACK_COUNT
+    if 0 <= idx < len(STACK_PRICES):
+        return STACK_PRICES[idx]
+    return None
+
+
+def get_silo_price(current_silos):
+    if current_silos < len(SILO_PRICES):
+        return SILO_PRICES[current_silos]
+    return SILO_PRICES[-1]
+
+
 def ensure_grid(player):
-    """Players who joined before the grid system won't have a 'grid' key yet.
-    Give them one, stacking whatever cities/ports they already own into Stack 1
-    so nothing gets lost. Safe to call repeatedly — does nothing once it exists."""
     grid = player.get("grid")
-    if isinstance(grid, list) and len(grid) == 9:
+    if isinstance(grid, list) and STARTING_STACK_COUNT <= len(grid) <= MAX_STACK_COUNT:
+        for box in grid:
+            box.setdefault("silo", 0)
+            box.setdefault("missile", None)
+        player["silos"] = sum(1 for box in grid if box.get("silo", 0) > 0)
         return grid
-    grid = [{"cities": 0, "ports": 0} for _ in range(9)]
-    grid[0]["cities"] = player.get("cities", 0)
-    grid[0]["ports"] = player.get("ports", 0)
-    player["grid"] = grid
-    return grid
+
+    if isinstance(grid, list) and len(grid) > 0:
+        total_cities = sum(box.get("cities", 0) for box in grid)
+        total_ports = sum(box.get("ports", 0) for box in grid)
+        total_silos = sum(1 for box in grid if box.get("silo", 0) > 0)
+    else:
+        total_cities = player.get("cities", 0)
+        total_ports = player.get("ports", 0)
+        total_silos = player.get("silos", 0)
+
+    new_grid = [{"cities": 0, "ports": 0, "silo": 0, "missile": None} for _ in range(STARTING_STACK_COUNT)]
+    new_grid[0]["cities"] = total_cities
+    new_grid[0]["ports"] = total_ports
+    for i in range(min(total_silos, len(new_grid))):
+        new_grid[i]["silo"] = 1
+    player["grid"] = new_grid
+    player["silos"] = sum(1 for box in new_grid if box.get("silo", 0) > 0)
+    return new_grid
 
 
 def transfer_structure_box(attacker, defender, structure_key):
-    """Moves one captured structure ('cities' or 'ports') out of whichever stack
-    the defender has one in, into that SAME stack number on the attacker's grid."""
     ensure_grid(attacker)
     ensure_grid(defender)
-    for idx in range(9):
+    for idx in range(len(defender["grid"])):
         if defender["grid"][idx][structure_key] > 0:
             defender["grid"][idx][structure_key] -= 1
-            attacker["grid"][idx][structure_key] += 1
+            target_idx = idx if idx < len(attacker["grid"]) else len(attacker["grid"]) - 1
+            attacker["grid"][target_idx][structure_key] += 1
             return
-    # Fallback (shouldn't normally happen): totals said there was one to take,
-    # but no stack shows it. Don't lose the structure, just seed Stack 1.
     attacker["grid"][0][structure_key] += 1
+
+
+def resolve_missile_strike(defender, stack_idx):
+    box = defender["grid"][stack_idx]
+    pool = (["cities"] * box["cities"]) + (["ports"] * box["ports"]) + (["silo"] * box.get("silo", 0))
+    if not pool:
+        return 0, 0, 0
+    destroy_count = round(len(pool) * MISSILE_DESTROY_PERCENT)
+    random.shuffle(pool)
+    destroyed = pool[:destroy_count]
+    cities_destroyed = destroyed.count("cities")
+    ports_destroyed = destroyed.count("ports")
+    silos_destroyed = destroyed.count("silo")
+    box["cities"] -= cities_destroyed
+    box["ports"] -= ports_destroyed
+    defender["cities"] -= cities_destroyed
+    defender["ports"] = defender.get("ports", 0) - ports_destroyed
+    if silos_destroyed:
+        box["silo"] = 0
+        box["missile"] = None
+        defender["silos"] = max(0, defender.get("silos", 0) - silos_destroyed)
+    if cities_destroyed:
+        defender["troop_cap"] = max(STARTING_TROOP_CAP, defender["troop_cap"] - cities_destroyed * CITY_TROOP_CAP_BONUS)
+        defender["troops"] = min(defender["troops"], defender["troop_cap"])
+    return cities_destroyed, ports_destroyed, silos_destroyed
 
 def calculate_troop_regen(current_troops, troop_cap):
     if troop_cap <= 0 or current_troops >= troop_cap:
@@ -259,8 +311,6 @@ def make_status_embed(online=True):
 
 
 async def set_status_all_guilds(online):
-    """Edits each server's saved status message. If the message got deleted (or there
-    isn't one yet), sends a fresh one and remembers its ID for next time."""
     for guild_id, guild_data in data["guilds"].items():
         channel_id = guild_data.get("status_channel_id")
         if not channel_id:
@@ -289,7 +339,6 @@ async def set_status_all_guilds(online):
 
 
 async def shutdown_and_exit():
-    """Runs on a clean Ctrl+C / stop signal: flips status messages to offline, then closes the bot."""
     print("Shutting down, updating status message(s)...")
     try:
         await set_status_all_guilds(False)
@@ -303,7 +352,6 @@ def _handle_stop_signal(sig, frame):
     if loop and loop.is_running():
         loop.call_soon_threadsafe(lambda: asyncio.ensure_future(shutdown_and_exit()))
     else:
-        # Bot never finished connecting — nothing online to flip offline, just exit normally.
         raise KeyboardInterrupt
 
 
@@ -311,7 +359,7 @@ signal.signal(signal.SIGINT, _handle_stop_signal)
 try:
     signal.signal(signal.SIGTERM, _handle_stop_signal)
 except (AttributeError, ValueError):
-    pass  # not every platform supports binding SIGTERM, that's fine
+    pass
 
 
 @bot.event
@@ -348,12 +396,24 @@ async def joingame(interaction: discord.Interaction):
 async def help_command(interaction: discord.Interaction):
     embed = discord.Embed(title="How to use", description="""This is a tutorial written by me (Supbro), this tutorial will be updated every time something new happens. 
 
-So, this bot is based off of openfront.io that is the main reason I built da bot. Do /joingame to join the leaderboard and get access to every other game command. It will start you off with a troop cap of 5000. You can’t really do much at the start and you have to wait for yourself to generate enough gold to buy either a city or a port in /gamehub. Cities increase your troop cap and generate you a little more gold per tick. Ports are different, they increase your base gold gain by 20 per port, however, every alliance you get it adds 20% on top of the base 20 per port. for example, if I have one alliance that means 100% (20) + 20% of 20, that means you get 24 gold per port, that might not seem like a lot, but if you have a lot of ports then it stacks up quick. 
+So, this bot is based off of openfront.io that is the main reason I built da bot. Do /joingame to join the leaderboard and get access to every other game command. It will start you off with a troop cap of 5000. You can’t really do much at the start and you have to wait for yourself to generate enough gold to buy either a city or a port in /gamehub build menu. 
 
-The attacking system is pretty simple, you do /attack, then select a player, after that you can choose from 15% 30%, 50% 75% and all in (100%) for your attacks. When you attack someone it will give the person you attacked a DM message saying that they have been attacked with amount of troops and they lost amount of troops. Attacking people also gives you a chance to destroy a structure. If you have no structures and no troops, then you eliminated, currently there isn’t a way to be revived so you just have to ping an admin. Attacking people also need some luck because the defender can lose up to 120% of the amount relative to the attacker’s troops that they sent, or as low as 60% relative to the attacker’s troops that they sent. The attacker on the other hand can lose up to 100% of their troops, or as low as 70% (the percentages can change, depending on how updated this tutorial is.)
+Cities increase your troop cap and generate you a little more gold per tick. 
+
+Ports are different, they increase your base gold gain by 20 per port, however, every alliance you get it adds 20% on top of the base 20 per port. for example, if I have one alliance that means 100% (20) + 20% of 20, that means you get 24 gold per port, that might not seem like a lot, but if you have a lot of ports then it stacks up quick. 
+
+The stack system, we talked about the structures, but not where the structures are. People start with 3 stacks and can buy snacks that cost more every time. Each stack has an unlimited amount of space to it. (Not including silos, those are limited to one per stack) the only downside in putting everything in one nest is that they can be easily bombed. The max amount of stacks is 6.
+
+The launch system, you might’ve seen a new launch button in the game hub, once you click on it it will let you launch from a specific silo if that silo is empty then it will let you buy a missile every silo can only load one missile. Currently the only kind of missile is atomic bomb. The atomic bomb destroys 50% of all structures in the stack of your choice. You cannot load atomic bombs using build. You can only load atomic bombs in the launch menu. That is a design flaw that I will keep in. If you launch a missile at an ally, the launch screen will give you the option to go through with the betrayal or cancel the launch. Launching a missile at an ally will be treated exactly the same as committing an assault on the ally. Both will give a 12 hour betrayal effect.
+
+Atomic bomb, the atomic bomb is priced at a fixed price of 15,000 gold. It can only be used if there is a silo.
+
+Hydrogen bomb, coming soon…
+
+The attacking system is pretty simple, you do /attack, then select a player, after that you can choose from 15% 30%, 50% 75% and all in (100%) for your attacks. When you attack someone it will give the person you attacked a DM message saying that they have been attacked with amount of troops and they lost amount of troops. Attacking people also gives you a chance to destroy a structure. If you have no structures and no troops, then you eliminated, currently there isn’t a way to be revived so you just have to ping an admin. Attacking people also need some luck because the defender can lose up to 120% of the amount relative to the attacker’s troops that they sent, or as low as 60% relative to the attacker’s troops that they sent. The attacker on the other hand can lose up to 100% of their troops, or as low as 70%
 
 Do /leaderboard to see other people, it is ordered by how much troops they currently have. 
-Do /gamehub to manage your land or view other people land
+Do /gamehub to manage your land or view other people land (or launch missiles)
 Do /attack to attack other people
 Do /joingame to join da game
 
@@ -388,15 +448,20 @@ def make_grid_embed(member, player, editable=True):
         title=f"{member.display_name}'s Building Stacks",
         color=discord.Color.gold()
     )
-    for idx in range(9):
-        box = player["grid"][idx]
+    for idx, box in enumerate(player["grid"]):
+        if box.get("silo", 0) > 0:
+            silo_line = f"🚀 Silo: Loaded ({MISSILE_TYPES[box['missile']]['label']})" if box.get("missile") else "🚀 Silo: Empty"
+        else:
+            silo_line = "🚀 Silo: No"
         embed.add_field(
             name=f"Stack {idx + 1}",
-            value=f"🏙 Cities: {box['cities']}\n⚓ Ports: {box['ports']}",
+            value=f"🏙 Cities: {box['cities']}\n⚓ Ports: {box['ports']}\n{silo_line}",
             inline=True
         )
     embed.add_field(name="Total Cities", value=str(player["cities"]), inline=True)
     embed.add_field(name="Total Ports", value=str(player.get("ports", 0)), inline=True)
+    embed.add_field(name="Total Silos", value=str(player.get("silos", 0)), inline=True)
+    embed.add_field(name="Stacks Unlocked", value=f"{len(player['grid'])}/{MAX_STACK_COUNT}", inline=True)
     if editable:
         embed.set_footer(text="Pick a building type below, then pick a stack to place it in.")
     return embed
@@ -605,6 +670,10 @@ class GameHubView(discord.ui.View):
         build_btn.callback = self.build
         self.add_item(build_btn)
 
+        launch_btn = discord.ui.Button(label="Launch", style=discord.ButtonStyle.danger, emoji="🚀")
+        launch_btn.callback = self.launch
+        self.add_item(launch_btn)
+
         alliance_btn = discord.ui.Button(label="Alliance", style=discord.ButtonStyle.blurple, emoji="🤝")
         alliance_btn.callback = self.alliance
         self.add_item(alliance_btn)
@@ -625,6 +694,21 @@ class GameHubView(discord.ui.View):
         embed = make_grid_embed(interaction.user, player, editable=True)
         view = GridBuildView(self.guild_id, self.user_id)
         await interaction.response.edit_message(embed=embed, view=view)
+
+    async def launch(self, interaction: discord.Interaction):
+        player = get_player(self.guild_id, self.user_id)
+        if not is_active_player(player):
+            await interaction.response.send_message("You can't do that rn.", ephemeral=True)
+            return
+        ensure_grid(player)
+        save_data(data)
+        if player.get("silos", 0) <= 0:
+            await interaction.response.send_message(
+                "You need to build a Missile Silo first (Build → Build Silo).", ephemeral=True
+            )
+            return
+        view = LaunchSiloPickView(self.guild_id, self.user_id)
+        await interaction.response.send_message("🚀 Choose which silo to launch from:", view=view, ephemeral=True)
 
     async def alliance(self, interaction: discord.Interaction):
         player = get_player(self.guild_id, self.user_id)
@@ -655,16 +739,20 @@ class GameHubView(discord.ui.View):
         await interaction.response.send_message("\n".join(lines), view=view, ephemeral=True)
 
 class GridBuildView(discord.ui.View):
-    """Shown after clicking Build on your own hub — the 3x3 grid plus buttons
-    to build a city, build a port, or go back."""
     def __init__(self, guild_id, user_id):
         super().__init__(timeout=180)
         self.guild_id = guild_id
         self.user_id = user_id
 
         player = get_player(guild_id, user_id)
+        if player:
+            ensure_grid(player)
         city_price = get_city_price(player["cities"]) if player else 0
         port_price = get_port_price(player.get("ports", 0)) if player else 0
+        stack_count = len(player["grid"]) if player else STARTING_STACK_COUNT
+        stack_price = get_stack_price(stack_count)
+        silo_price = get_silo_price(player.get("silos", 0)) if player else 0
+        silo_slots_available = bool(player) and any(box.get("silo", 0) == 0 for box in player["grid"])
 
         city_btn = discord.ui.Button(label=f"Build City ({city_price:,} gold)", style=discord.ButtonStyle.green, emoji="🏙")
         city_btn.callback = self.pick_city_spot
@@ -673,6 +761,16 @@ class GridBuildView(discord.ui.View):
         port_btn = discord.ui.Button(label=f"Build Port ({port_price:,} gold)", style=discord.ButtonStyle.green, emoji="⚓")
         port_btn.callback = self.pick_port_spot
         self.add_item(port_btn)
+
+        if silo_slots_available:
+            silo_btn = discord.ui.Button(label=f"Build Silo ({silo_price:,} gold)", style=discord.ButtonStyle.blurple, emoji="🚀")
+            silo_btn.callback = self.pick_silo_spot
+            self.add_item(silo_btn)
+
+        if stack_price is not None:
+            stack_btn = discord.ui.Button(label=f"Buy Stack ({stack_price:,} gold)", style=discord.ButtonStyle.blurple, emoji="📦")
+            stack_btn.callback = self.buy_stack
+            self.add_item(stack_btn)
 
         back_btn = discord.ui.Button(label="Back to Hub", style=discord.ButtonStyle.grey)
         back_btn.callback = self.back_to_hub
@@ -689,6 +787,32 @@ class GridBuildView(discord.ui.View):
 
     async def pick_port_spot(self, interaction: discord.Interaction):
         await self._open_position_picker(interaction, "ports", "port")
+
+    async def pick_silo_spot(self, interaction: discord.Interaction):
+        await self._open_position_picker(interaction, "silo", "missile silo")
+
+    async def buy_stack(self, interaction: discord.Interaction):
+        player = get_player(self.guild_id, self.user_id)
+        if not is_active_player(player):
+            await interaction.response.send_message("You can't do that rn.", ephemeral=True)
+            return
+        ensure_grid(player)
+        price = get_stack_price(len(player["grid"]))
+        if price is None:
+            await interaction.response.send_message(f"You're already at the max of {MAX_STACK_COUNT} stacks.", ephemeral=True)
+            return
+        if player["gold"] < price:
+            await interaction.response.send_message(
+                f"Not enough gold. You need {price:,}, you have {player['gold']:,}.", ephemeral=True
+            )
+            return
+        player["gold"] -= price
+        player["grid"].append({"cities": 0, "ports": 0, "silo": 0, "missile": None})
+        save_data(data)
+
+        embed = make_grid_embed(interaction.user, player, editable=True)
+        view = GridBuildView(self.guild_id, self.user_id)
+        await interaction.response.edit_message(embed=embed, view=view)
 
     async def _open_position_picker(self, interaction: discord.Interaction, structure_key, label):
         player = get_player(self.guild_id, self.user_id)
@@ -712,19 +836,28 @@ class GridBuildView(discord.ui.View):
 
 
 class BuildPositionView(discord.ui.View):
-    """The 9 stack-picker buttons (left-to-right, top-to-bottom), plus Cancel."""
     def __init__(self, guild_id, user_id, structure_key):
         super().__init__(timeout=120)
         self.guild_id = guild_id
         self.user_id = user_id
-        self.structure_key = structure_key  # "cities" or "ports"
+        self.structure_key = structure_key
 
-        for idx in range(9):
-            btn = discord.ui.Button(label=str(idx + 1), style=discord.ButtonStyle.blurple, row=idx // 3)
+        player = get_player(guild_id, user_id)
+        ensure_grid(player)
+        grid = player["grid"]
+
+        if structure_key == "silo":
+            eligible = [i for i, box in enumerate(grid) if box.get("silo", 0) == 0]
+        else:
+            eligible = list(range(len(grid)))
+
+        for row_pos, idx in enumerate(eligible):
+            btn = discord.ui.Button(label=str(idx + 1), style=discord.ButtonStyle.blurple, row=row_pos // 3)
             btn.callback = self._make_callback(idx)
             self.add_item(btn)
 
-        cancel_btn = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.grey, row=3)
+        cancel_row = (len(eligible) - 1) // 3 + 1 if eligible else 0
+        cancel_btn = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.grey, row=cancel_row)
         cancel_btn.callback = self.cancel
         self.add_item(cancel_btn)
 
@@ -748,8 +881,14 @@ class BuildPositionView(discord.ui.View):
 
         if self.structure_key == "cities":
             price = get_city_price(player["cities"])
-        else:
+        elif self.structure_key == "ports":
             price = get_port_price(player.get("ports", 0))
+        else:
+            price = get_silo_price(player.get("silos", 0))
+
+        if self.structure_key == "silo" and player["grid"][idx].get("silo", 0) > 0:
+            await interaction.response.send_message("That stack already has a silo — only one per stack.", ephemeral=True)
+            return
 
         if player["gold"] < price:
             await interaction.response.send_message(
@@ -758,10 +897,14 @@ class BuildPositionView(discord.ui.View):
             return
 
         player["gold"] -= price
-        player["grid"][idx][self.structure_key] += 1
-        player[self.structure_key] = player.get(self.structure_key, 0) + 1
-        if self.structure_key == "cities":
-            player["troop_cap"] += CITY_TROOP_CAP_BONUS
+        if self.structure_key == "silo":
+            player["grid"][idx]["silo"] = 1
+            player["silos"] = player.get("silos", 0) + 1
+        else:
+            player["grid"][idx][self.structure_key] += 1
+            player[self.structure_key] = player.get(self.structure_key, 0) + 1
+            if self.structure_key == "cities":
+                player["troop_cap"] += CITY_TROOP_CAP_BONUS
         save_data(data)
 
         embed = make_grid_embed(interaction.user, player, editable=True)
@@ -779,7 +922,6 @@ class BuildPositionView(discord.ui.View):
 
 
 class PublicGridView(discord.ui.View):
-    """Read-only grid view for someone else's hub — just a Back button."""
     def __init__(self, guild_id, member: discord.Member):
         super().__init__(timeout=180)
         self.guild_id = guild_id
@@ -797,13 +939,12 @@ class PublicGridView(discord.ui.View):
 
 
 class PublicHubView(discord.ui.View):
-    """Shown under someone ELSE's hub — read only, just a View Grid button."""
     def __init__(self, guild_id, member: discord.Member):
         super().__init__(timeout=180)
         self.guild_id = guild_id
         self.member = member
 
-    @discord.ui.button(label="View Grid", style=discord.ButtonStyle.blurple, emoji="🗺")
+    @discord.ui.button(label="View Stacks", style=discord.ButtonStyle.blurple, emoji="🗺")
     async def view_grid(self, interaction: discord.Interaction, button: discord.ui.Button):
         player = get_player(self.guild_id, self.member.id)
         if not is_active_player(player):
@@ -814,6 +955,330 @@ class PublicHubView(discord.ui.View):
         embed = make_grid_embed(self.member, player, editable=False)
         view = PublicGridView(self.guild_id, self.member)
         await interaction.response.edit_message(embed=embed, view=view)
+
+
+class LaunchSiloPickView(discord.ui.View):
+    def __init__(self, guild_id, user_id):
+        super().__init__(timeout=90)
+        self.guild_id = guild_id
+        self.user_id = user_id
+
+        player = get_player(guild_id, user_id)
+        ensure_grid(player)
+        silo_indices = [i for i, box in enumerate(player["grid"]) if box.get("silo", 0) > 0]
+
+        for idx in silo_indices:
+            box = player["grid"][idx]
+            status = "Loaded" if box.get("missile") else "Empty"
+            btn = discord.ui.Button(label=f"Stack {idx + 1} ({status})", style=discord.ButtonStyle.blurple, emoji="🚀")
+            btn.callback = self._make_callback(idx)
+            self.add_item(btn)
+
+        cancel_btn = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.grey)
+        cancel_btn.callback = self.cancel
+        self.add_item(cancel_btn)
+
+    def _make_callback(self, idx):
+        async def callback(interaction: discord.Interaction):
+            await self.pick_silo(interaction, idx)
+        return callback
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your launch menu.", ephemeral=True)
+            return False
+        return True
+
+    async def pick_silo(self, interaction: discord.Interaction, idx):
+        player = get_player(self.guild_id, self.user_id)
+        if not is_active_player(player):
+            await interaction.response.edit_message(content="You can't do that rn.", view=None)
+            return
+        ensure_grid(player)
+        if idx >= len(player["grid"]) or player["grid"][idx].get("silo", 0) <= 0:
+            await interaction.response.edit_message(content="That silo isn't there anymore.", view=None)
+            return
+
+        loaded_missile = player["grid"][idx].get("missile")
+        if loaded_missile:
+            missile_label = MISSILE_TYPES[loaded_missile]["label"]
+            view = LaunchTargetSelectView(self.guild_id, self.user_id, idx, loaded_missile)
+            await interaction.response.edit_message(
+                content=f"Stack {idx + 1} has a {missile_label} loaded and ready. Who are you launching at?",
+                view=view
+            )
+            return
+
+        view = LaunchMissilePickView(self.guild_id, self.user_id, idx)
+        await interaction.response.edit_message(
+            content=f"Stack {idx + 1}'s silo is empty. Choose a missile to load:",
+            view=view
+        )
+
+    async def cancel(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(content="Launch cancelled.", view=None)
+
+
+class LaunchMissilePickView(discord.ui.View):
+    def __init__(self, guild_id, user_id, silo_index):
+        super().__init__(timeout=90)
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.silo_index = silo_index
+
+        for key, info in MISSILE_TYPES.items():
+            btn = discord.ui.Button(label=f"{info['label']} ({info['price']:,} gold)", style=discord.ButtonStyle.danger, emoji=info["emoji"])
+            btn.callback = self._make_callback(key)
+            self.add_item(btn)
+
+        cancel_btn = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.grey)
+        cancel_btn.callback = self.cancel
+        self.add_item(cancel_btn)
+
+    def _make_callback(self, missile_key):
+        async def callback(interaction: discord.Interaction):
+            await self.pick_missile(interaction, missile_key)
+        return callback
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your launch menu.", ephemeral=True)
+            return False
+        return True
+
+    async def pick_missile(self, interaction: discord.Interaction, missile_key):
+        player = get_player(self.guild_id, self.user_id)
+        if not is_active_player(player):
+            await interaction.response.edit_message(content="You can't do that rn.", view=None)
+            return
+        ensure_grid(player)
+        if self.silo_index >= len(player["grid"]) or player["grid"][self.silo_index].get("silo", 0) <= 0:
+            await interaction.response.edit_message(content="That silo isn't there anymore.", view=None)
+            return
+        if player["grid"][self.silo_index].get("missile"):
+            await interaction.response.edit_message(content="That silo already has a missile loaded.", view=None)
+            return
+
+        price = MISSILE_TYPES[missile_key]["price"]
+        if player["gold"] < price:
+            await interaction.response.edit_message(
+                content=f"Not enough gold. You need {price:,}, you have {player['gold']:,}.", view=None
+            )
+            return
+
+        player["gold"] -= price
+        player["grid"][self.silo_index]["missile"] = missile_key
+        save_data(data)
+
+        view = LaunchTargetSelectView(self.guild_id, self.user_id, self.silo_index, missile_key)
+        missile_label = MISSILE_TYPES[missile_key]["label"]
+        await interaction.response.edit_message(
+            content=f"Loaded {missile_label} into Stack {self.silo_index + 1}. Who are you launching at?",
+            view=view
+        )
+
+    async def cancel(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(content="Launch cancelled.", view=None)
+
+
+class LaunchTargetSelectView(discord.ui.View):
+    def __init__(self, guild_id, user_id, silo_index, missile_key):
+        super().__init__(timeout=90)
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.silo_index = silo_index
+        self.missile_key = missile_key
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your launch menu.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.select(cls=discord.ui.UserSelect, placeholder="Choose who to launch at", min_values=1, max_values=1)
+    async def pick_target(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
+        target = select.values[0]
+        attacker = get_player(self.guild_id, self.user_id)
+        if not is_active_player(attacker):
+            await interaction.response.edit_message(content="You can't do that rn.", view=None)
+            return
+        if target.id == self.user_id:
+            await interaction.response.edit_message(content="You can't nuke yourself gng.", view=None)
+            return
+        defender = get_player(self.guild_id, target.id)
+        if not is_active_player(defender):
+            await interaction.response.edit_message(content=f"{target.display_name} isn't a valid target.", view=None)
+            return
+        ensure_grid(attacker)
+        if self.silo_index >= len(attacker["grid"]) or attacker["grid"][self.silo_index].get("silo", 0) <= 0:
+            await interaction.response.edit_message(content="That silo isn't there anymore.", view=None)
+            return
+
+        alliances = prune_alliances(attacker)
+        save_data(data)
+        if str(target.id) in alliances:
+            view = LaunchBetrayConfirmView(self.guild_id, interaction.user, target, self.silo_index, self.missile_key)
+            await interaction.response.edit_message(
+                content=(
+                    f"You're currently **allied** with {target.display_name}. Launching a missile at them will break "
+                    f"the alliance and mark you as a betrayer (you'll take extra damage while defending)."
+                ),
+                view=view
+            )
+            return
+
+        ensure_grid(defender)
+        view = LaunchStackPickView(self.guild_id, interaction.user, target, self.silo_index, self.missile_key)
+        await interaction.response.edit_message(
+            content=f"Which of {target.display_name}'s stacks are you targeting?",
+            view=view
+        )
+
+
+class LaunchBetrayConfirmView(discord.ui.View):
+    def __init__(self, guild_id, attacker_member, defender_member, silo_index, missile_key):
+        super().__init__(timeout=60)
+        self.guild_id = guild_id
+        self.attacker_member = attacker_member
+        self.defender_member = defender_member
+        self.silo_index = silo_index
+        self.missile_key = missile_key
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.attacker_member.id:
+            await interaction.response.send_message("This isn't your confirmation menu.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Betray & Launch", style=discord.ButtonStyle.danger, emoji="🗡")
+    async def betray_and_launch(self, interaction: discord.Interaction, button: discord.ui.Button):
+        attacker = get_player(self.guild_id, self.attacker_member.id)
+        defender = get_player(self.guild_id, self.defender_member.id)
+        if not is_active_player(attacker) or not is_active_player(defender):
+            await interaction.response.edit_message(content="One of the players is no longer available.", view=None)
+            return
+
+        break_alliance(self.guild_id, self.attacker_member.id, self.defender_member.id)
+        attacker["betrayer_until"] = time.time() + BETRAYAL_DURATION_SECONDS
+        save_data(data)
+
+        ensure_grid(defender)
+        view = LaunchStackPickView(self.guild_id, self.attacker_member, self.defender_member, self.silo_index, self.missile_key)
+        await interaction.response.edit_message(
+            content=(
+                f"You betrayed your alliance with {self.defender_member.display_name}! "
+                f"Which of their stacks are you targeting?"
+            ),
+            view=view
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.grey)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="Launch cancelled.", view=None)
+
+
+class LaunchStackPickView(discord.ui.View):
+    def __init__(self, guild_id, attacker_member, defender_member, silo_index, missile_key):
+        super().__init__(timeout=90)
+        self.guild_id = guild_id
+        self.attacker_member = attacker_member
+        self.defender_member = defender_member
+        self.silo_index = silo_index
+        self.missile_key = missile_key
+
+        defender = get_player(guild_id, defender_member.id)
+        ensure_grid(defender)
+        stack_count = len(defender["grid"])
+
+        for idx in range(stack_count):
+            btn = discord.ui.Button(label=f"Stack {idx + 1}", style=discord.ButtonStyle.danger, row=idx // 3)
+            btn.callback = self._make_callback(idx)
+            self.add_item(btn)
+
+        cancel_row = (stack_count - 1) // 3 + 1
+        cancel_btn = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.grey, row=cancel_row)
+        cancel_btn.callback = self.cancel
+        self.add_item(cancel_btn)
+
+    def _make_callback(self, idx):
+        async def callback(interaction: discord.Interaction):
+            await self.launch_at(interaction, idx)
+        return callback
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.attacker_member.id:
+            await interaction.response.send_message("This isn't your launch menu.", ephemeral=True)
+            return False
+        return True
+
+    async def launch_at(self, interaction: discord.Interaction, idx):
+        attacker = get_player(self.guild_id, self.attacker_member.id)
+        defender = get_player(self.guild_id, self.defender_member.id)
+        if not is_active_player(attacker):
+            await interaction.response.edit_message(content="You can't do that rn.", view=None)
+            return
+        if not is_active_player(defender):
+            await interaction.response.edit_message(content="That player is no longer a valid target.", view=None)
+            return
+        ensure_grid(attacker)
+        ensure_grid(defender)
+
+        if self.silo_index >= len(attacker["grid"]) or attacker["grid"][self.silo_index].get("silo", 0) <= 0:
+            await interaction.response.edit_message(content="That silo isn't there anymore.", view=None)
+            return
+        if attacker["grid"][self.silo_index].get("missile") != self.missile_key:
+            await interaction.response.edit_message(content="That missile isn't loaded anymore.", view=None)
+            return
+        if idx >= len(defender["grid"]):
+            await interaction.response.edit_message(content="That stack doesn't exist anymore.", view=None)
+            return
+
+        attacker["grid"][self.silo_index]["missile"] = None
+
+        cities_destroyed, ports_destroyed, silos_destroyed = resolve_missile_strike(defender, idx)
+        total_destroyed = cities_destroyed + ports_destroyed + silos_destroyed
+
+        eliminated = False
+        if defender["troops"] <= 0 and defender["cities"] <= 0:
+            eliminated = True
+            defender["eliminated"] = True
+            defender["alliances"] = {}
+
+        save_data(data)
+
+        missile_label = MISSILE_TYPES[self.missile_key]["label"]
+        missile_emoji = MISSILE_TYPES[self.missile_key]["emoji"]
+
+        dm_sent = True
+        try:
+            dm_embed = discord.Embed(
+                title=f"{missile_emoji} You've Been Bombed!",
+                description=f"**{self.attacker_member.display_name}** launched a {missile_label} at your Stack {idx + 1}.",
+                color=discord.Color.dark_red()
+            )
+            dm_embed.add_field(name=f"{missile_emoji} Missile Used", value=missile_label, inline=True)
+            dm_embed.add_field(name="🎯 Stack Hit", value=f"Stack {idx + 1}", inline=True)
+            dm_embed.add_field(name="🏙 Structures Lost", value=f"{cities_destroyed} cities, {ports_destroyed} ports, {silos_destroyed} silos", inline=True)
+            if eliminated:
+                dm_embed.add_field(name="💀 Status", value="You have been eliminated and can no longer rejoin.", inline=False)
+            dm_embed.set_footer(text="do /attack or build another silo to retaliate")
+            await self.defender_member.send(embed=dm_embed)
+        except (discord.Forbidden, discord.HTTPException):
+            dm_sent = False
+
+        result_lines = [
+            f"You launched a {missile_label} from Stack {self.silo_index + 1} at {self.defender_member.display_name}'s Stack {idx + 1}.",
+            f"Destroyed {total_destroyed} structure(s) ({cities_destroyed} cities, {ports_destroyed} ports, {silos_destroyed} silos)."
+        ]
+        if not dm_sent:
+            result_lines.append("⚠️ Couldn't DM them (their settings are blocking it) they won't know unless you tell them.")
+        if eliminated:
+            result_lines.append(f"{self.defender_member.display_name} has been eliminated!")
+
+        await interaction.response.edit_message(content="\n".join(result_lines), view=None)
+
+    async def cancel(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(content="Launch cancelled.", view=None)
 
 
 @bot.tree.command(name="gamehub", description="Manage your lands, or optionally view another player's stuff")
@@ -844,9 +1309,11 @@ async def gamehub(interaction: discord.Interaction, member: discord.Member = Non
 
 @bot.tree.command(name="leaderboard", description="See the leaderboard")
 async def leaderboard(interaction: discord.Interaction):
+    await interaction.response.defer()   
+
     players = get_guild_players(interaction.guild_id)
     if not players:
-        await interaction.response.send_message("No one has joined the game yet. rip", ephemeral=True)
+        await interaction.followup.send("No one has joined the game yet. rip", ephemeral=True)
         return
 
     sorted_players = sorted(players.items(), key=lambda item: item[1]["troops"], reverse=True)
@@ -867,7 +1334,7 @@ async def leaderboard(interaction: discord.Interaction):
         lines.append(f"{rank_icon} {name} — Troops: {pdata['troops']:,}/{pdata['troop_cap']:,} | Gold: {pdata['gold']:,}")
 
     embed = discord.Embed(title="da Leaderboard", description="\n".join(lines), color=discord.Color.blue())
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 class AttackView(discord.ui.View):
@@ -1074,7 +1541,8 @@ async def adminrevive(interaction: discord.Interaction, target: discord.Member):
     player["gold"] = 0
     player["cities"] = 0
     player["ports"] = 0
-    player["grid"] = [{"cities": 0, "ports": 0} for _ in range(9)]
+    player["silos"] = 0
+    player["grid"] = [{"cities": 0, "ports": 0, "silo": 0, "missile": None} for _ in range(STARTING_STACK_COUNT)]
     player["eliminated"] = False
     save_data(data)
 
