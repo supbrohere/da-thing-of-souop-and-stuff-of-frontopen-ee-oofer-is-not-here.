@@ -39,11 +39,23 @@ ATTACKER_LOSS_MIN = 0.70
 ATTACKER_LOSS_MAX = 1.00
 BASE_CAPTURE_CHANCE = 0.30
 HIGH_CAPTURE_CHANCE = 0.75
+ZERO_TROOP_CAPTURE_BASE = 2
 ATTACK_PERCENT_OPTIONS = [0.15, 0.30, 0.50, 0.75, 1.0]
 ATTACK_PERCENT_LABELS = {0.15: "15%", 0.30: "30%", 0.50: "50%", 0.75: "75%", 1.0: "All In"}
 ALLIANCE_DURATION_OPTIONS_DAYS = [2, 3, 4, 5]
-BETRAYER_LOSS_MULTIPLIER = 1.75
-BETRAYAL_DURATION_SECONDS = 12 * 3600
+BETRAYER_LOSS_MULTIPLIER = 1.5
+BETRAYAL_DURATION_SECONDS = 18 * 3600
+OWNER_ID = 1091868001109803080
+SPAWN_IMMUNITY_SECONDS = 6 * 3600
+ATTACK_BUFF_DAMAGE_MULTIPLIER = 1.5
+ATTACK_BUFF_DURATION_SECONDS = 6 * 3600
+SILO_COOLDOWN_SECONDS = 2 * 3600
+SAM_PRICES = [20000, 45000, 80000]
+SAM_MAX_LEVEL = 3
+SAM_INTERCEPTOR_PRICE = 20000
+SAM_COOLDOWN_SECONDS = 2 * 3600
+STREAK_DAY_BOUNDARY_UTC_SECONDS = 22 * 3600
+STREAK_BONUS_GOLD = 12000
 DATA_FILE = "game_data.json"
 
 intents = discord.Intents.default()
@@ -85,6 +97,20 @@ def get_guild_dict(guild_id):
     return data["guilds"][gid]
 
 
+async def send_action_log(guild_id, embed):
+    guild_dict = get_guild_dict(guild_id)
+    channel_id = guild_dict.get("log_channel_id")
+    if not channel_id:
+        return
+    channel = bot.get_channel(int(channel_id))
+    if channel is None:
+        return
+    try:
+        await channel.send(embed=embed)
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+
 def get_player(guild_id, user_id):
     players = get_guild_players(guild_id)
     return players.get(str(user_id))
@@ -104,10 +130,19 @@ def create_player(guild_id, user_id):
         "cities": 0,
         "ports": 0,
         "silos": 0,
-        "grid": [{"cities": 0, "ports": 0, "silo": 0, "missile": None} for _ in range(STARTING_STACK_COUNT)],
-"eliminated": False,
+        "grid": [{"cities": 0, "ports": 0, "silo": 0, "missile": None, "cooldown_until": 0, "sam_level": 0, "sam_stock": 0, "sam_cooldown_until": 0} for _ in range(STARTING_STACK_COUNT)],
+        "eliminated": False,
         "alliances": {},
-        "betrayer_until": 0
+        "betrayer_until": 0,
+        "immune_until": time.time() + SPAWN_IMMUNITY_SECONDS,
+        "attack_buff_until": 0,
+        "pending_free_silos": 0,
+        "pending_free_ports": 0,
+        "streak_number": 0,
+        "streak_claimed_days": [],
+        "streak_bonus_claimed": 0,
+        "last_active_streak_day": None,
+        "zero_troop_streaks": {}
     }
     save_data(data)
     return players[uid]
@@ -169,6 +204,10 @@ def ensure_grid(player):
         for box in grid:
             box.setdefault("silo", 0)
             box.setdefault("missile", None)
+            box.setdefault("cooldown_until", 0)
+            box.setdefault("sam_level", 0)
+            box.setdefault("sam_stock", 0)
+            box.setdefault("sam_cooldown_until", 0)
         player["silos"] = sum(1 for box in grid if box.get("silo", 0) > 0)
         return grid
 
@@ -181,7 +220,7 @@ def ensure_grid(player):
         total_ports = player.get("ports", 0)
         total_silos = player.get("silos", 0)
 
-    new_grid = [{"cities": 0, "ports": 0, "silo": 0, "missile": None} for _ in range(STARTING_STACK_COUNT)]
+    new_grid = [{"cities": 0, "ports": 0, "silo": 0, "missile": None, "cooldown_until": 0, "sam_level": 0, "sam_stock": 0, "sam_cooldown_until": 0} for _ in range(STARTING_STACK_COUNT)]
     new_grid[0]["cities"] = total_cities
     new_grid[0]["ports"] = total_ports
     for i in range(min(total_silos, len(new_grid))):
@@ -264,6 +303,136 @@ def is_betrayer(player, now=None):
     if now is None:
         now = time.time()
     return player.get("betrayer_until", 0) > now
+
+
+def is_immune(player, now=None):
+    if now is None:
+        now = time.time()
+    return player.get("immune_until", 0) > now
+
+
+def has_admin_access(interaction: discord.Interaction):
+    return interaction.user.id == OWNER_ID or interaction.permissions.manage_guild
+
+
+def is_owner_bypass(interaction: discord.Interaction):
+    return interaction.user.id == OWNER_ID and not interaction.permissions.manage_guild
+
+
+def is_attack_buffed(player, now=None):
+    if now is None:
+        now = time.time()
+    return player.get("attack_buff_until", 0) > now
+
+
+def is_silo_on_cooldown(box, now=None):
+    if now is None:
+        now = time.time()
+    return box.get("cooldown_until", 0) > now
+
+
+def get_sam_upgrade_price(current_level):
+    if current_level < SAM_MAX_LEVEL:
+        return SAM_PRICES[current_level]
+    return None
+
+
+def is_sam_on_cooldown(box, now=None):
+    if now is None:
+        now = time.time()
+    return box.get("sam_cooldown_until", 0) > now
+
+
+def can_sam_intercept(box, now=None):
+    return box.get("sam_level", 0) > 0 and box.get("sam_stock", 0) > 0 and not is_sam_on_cooldown(box, now)
+
+
+def try_intercept(defender, stack_idx):
+    box = defender["grid"][stack_idx]
+    if not can_sam_intercept(box):
+        return False
+    box["sam_stock"] -= 1
+    if box["sam_stock"] <= 0:
+        box["sam_cooldown_until"] = time.time() + SAM_COOLDOWN_SECONDS
+    return True
+
+
+def format_remaining(seconds):
+    seconds = max(0, int(seconds))
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+def get_streak_day_index(ts=None):
+    if ts is None:
+        ts = time.time()
+    return int((int(ts) - STREAK_DAY_BOUNDARY_UTC_SECONDS) // 86400)
+
+
+def update_daily_streak(player):
+    today = get_streak_day_index()
+    last = player.get("last_active_streak_day")
+    if last == today:
+        return
+    if last is not None and today - last == 1:
+        player["streak_number"] = player.get("streak_number", 0) + 1
+    else:
+        player["streak_number"] = 1
+        player["streak_claimed_days"] = []
+        player["streak_bonus_claimed"] = 0
+    player["last_active_streak_day"] = today
+
+
+def get_streak_reward_label(day_number):
+    if day_number == 1:
+        return "5,000 gold"
+    if day_number == 2:
+        return "a free Missile Silo"
+    if day_number == 3:
+        return "10,000 gold"
+    if day_number == 4:
+        return "6-hour +50% attack damage buff"
+    if day_number == 5:
+        return "10,000 gold"
+    if day_number == 6:
+        return "3 free Ports"
+    if day_number == 7:
+        return "full troop refill"
+    return f"{STREAK_BONUS_GOLD:,} gold"
+
+
+def apply_streak_reward(player, day_number):
+    if day_number == 1:
+        player["gold"] += 5000
+    elif day_number == 2:
+        player["pending_free_silos"] = player.get("pending_free_silos", 0) + 1
+    elif day_number == 3:
+        player["gold"] += 10000
+    elif day_number == 4:
+        player["attack_buff_until"] = time.time() + ATTACK_BUFF_DURATION_SECONDS
+    elif day_number == 5:
+        player["gold"] += 10000
+    elif day_number == 6:
+        player["pending_free_ports"] = player.get("pending_free_ports", 0) + 3
+    elif day_number == 7:
+        player["troops"] = player["troop_cap"]
+    else:
+        player["gold"] += STREAK_BONUS_GOLD
+
+
+async def track_activity_for_streak(interaction: discord.Interaction) -> bool:
+    if interaction.guild_id is not None:
+        player = get_player(interaction.guild_id, interaction.user.id)
+        if player is not None:
+            update_daily_streak(player)
+            save_data(data)
+    return True
+
+
+bot.tree.interaction_check = track_activity_for_streak
 
 def process_ticks(now=None):
     if now is None:
@@ -394,30 +563,71 @@ async def joingame(interaction: discord.Interaction):
 
 @bot.tree.command(name="help", description="How to use the bot")
 async def help_command(interaction: discord.Interaction):
-    embed = discord.Embed(title="How to use", description="""This is a tutorial written by me (Supbro), this tutorial will be updated every time something new happens. 
-
-So, this bot is based off of openfront.io that is the main reason I built da bot. Do /joingame to join the leaderboard and get access to every other game command. It will start you off with a troop cap of 5000. You can’t really do much at the start and you have to wait for yourself to generate enough gold to buy either a city or a port in /gamehub build menu. 
-
-Cities increase your troop cap and generate you a little more gold per tick. 
-
-Ports are different, they increase your base gold gain by 20 per port, however, every alliance you get it adds 20% on top of the base 20 per port. for example, if I have one alliance that means 100% (20) + 20% of 20, that means you get 24 gold per port, that might not seem like a lot, but if you have a lot of ports then it stacks up quick. 
-
-The stack system, we talked about the structures, but not where the structures are. People start with 3 stacks and can buy snacks that cost more every time. Each stack has an unlimited amount of space to it. (Not including silos, those are limited to one per stack) the only downside in putting everything in one nest is that they can be easily bombed. The max amount of stacks is 6.
-
-The launch system, you might’ve seen a new launch button in the game hub, once you click on it it will let you launch from a specific silo if that silo is empty then it will let you buy a missile every silo can only load one missile. Currently the only kind of missile is atomic bomb. The atomic bomb destroys 50% of all structures in the stack of your choice. You cannot load atomic bombs using build. You can only load atomic bombs in the launch menu. That is a design flaw that I will keep in. If you launch a missile at an ally, the launch screen will give you the option to go through with the betrayal or cancel the launch. Launching a missile at an ally will be treated exactly the same as committing an assault on the ally. Both will give a 12 hour betrayal effect.
-
-Atomic bomb, the atomic bomb is priced at a fixed price of 15,000 gold. It can only be used if there is a silo.
-
-Hydrogen bomb, coming soon…
-
-The attacking system is pretty simple, you do /attack, then select a player, after that you can choose from 15% 30%, 50% 75% and all in (100%) for your attacks. When you attack someone it will give the person you attacked a DM message saying that they have been attacked with amount of troops and they lost amount of troops. Attacking people also gives you a chance to destroy a structure. If you have no structures and no troops, then you eliminated, currently there isn’t a way to be revived so you just have to ping an admin. Attacking people also need some luck because the defender can lose up to 120% of the amount relative to the attacker’s troops that they sent, or as low as 60% relative to the attacker’s troops that they sent. The attacker on the other hand can lose up to 100% of their troops, or as low as 70%
-
-Do /leaderboard to see other people, it is ordered by how much troops they currently have. 
-Do /gamehub to manage your land or view other people land (or launch missiles)
-Do /attack to attack other people
-Do /joingame to join da game
-
-If you have any other questions, feel free to ping the Admins (if you are not in the MOON server then don’t ping the admin because they probably don’t know much about the bot, no disrespect)""", color=discord.Color.gold())
+    embed = discord.Embed(title="How to Play", color=0xFFFF00)
+    embed.add_field(
+        name="Getting Started",
+        value=(
+            "`/joingame` joins the leaderboard, unlocks all commands, starts you with a 5,000 troop capacity.\n"
+            "Wait for gold to accumulate, then buy a city or port with `/gamehub` (build menu)."
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="Structures",
+        value=(
+            "**Cities** - raises your troop capacity and generate extra gold per tick.\n"
+            "**Ports** - adds +20 base gold per port. Each alliance you have adds +20% on top of that "
+            "base 20 (e.g., 1 alliance = 24 gold/port). Scales fast with more ports."
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="Stacks",
+        value=(
+            "You start with 3 stacks; buying more costs increasingly more gold (max 6). Each stack holds "
+            "an unlimited amount of structures, with an exception of silos (1 per stack). "
+            "*NOTE: Putting everything in one stack makes it an easy bombing target.*"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="Launching Missiles",
+        value=(
+            "Use the launch button in `/gamehub` to fire from a silo (If empty, you'll be prompted to buy a missile).\n"
+            "Currently, only the **Atomic Bomb** exists (15,000 gold) and requires a silo. It destroys 50% of "
+            "structures in the targeted stack. *Hydrogen Bombs are coming soon.*\n"
+            "**Atomic bombs** can only be loaded via the launch menu, not the build menu.\n"
+            "Launching at an ally will trigger a **betrayal warning** (confirm/cancel) and applies the same "
+            "18-hour betrayal effect as attacking them."
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="Attacking",
+        value=(
+            "`/attack` allows you to attack someone. First you pick a target, then how much troops to send: "
+            "**15%**, **30%**, **50%**, **75%**, or **100%** (all in). Each attack has a chance to destroy a structure on hit.\n"
+            "Your target gets a DM with troops sent/lost. Losses are randomized: defenders can lose **60**-**120%** "
+            "*(relative to attacker's sent troops);* attackers lose **70**-**100%** of their own.\n"
+            "No structures + no troops = **eliminated**. *No revival system yet, ping an admin.*"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="Commands",
+        value=(
+            "`/joingame` - Join the game\n"
+            "`/gamehub` - Manage/view land, launch missiles\n"
+            "`/attack` - Attack a player\n"
+            "`/leaderboard` - Ranked by current troops"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="Questions?",
+        value="Ping an Admin in the [MOON](https://discord.gg/NnY7e739ue) server. Admins elsewhere likely won't know the bot as we do.",
+        inline=False
+    )
     await interaction.response.send_message(embed=embed)
 
 
@@ -438,6 +648,28 @@ def make_hub_embed(member, player):
     embed.add_field(name="Ports", value=ports_value, inline=True)
 
     embed.add_field(name="Gold per tick", value=str(gold_regen_for(player)), inline=True)
+
+    now = time.time()
+    active_effects = []
+    if is_immune(player, now):
+        active_effects.append(f"🛡 Spawn Immunity — {format_remaining(player['immune_until'] - now)} left")
+    if is_attack_buffed(player, now):
+        bonus_pct = int((ATTACK_BUFF_DAMAGE_MULTIPLIER - 1) * 100)
+        active_effects.append(f"⚔️ Attack Buff (+{bonus_pct}% dmg) — {format_remaining(player['attack_buff_until'] - now)} left")
+    if is_betrayer(player, now):
+        bonus_pct = int((BETRAYER_LOSS_MULTIPLIER - 1) * 100)
+        active_effects.append(f"🗡 Betrayer Debuff (+{bonus_pct}% dmg taken) — {format_remaining(player['betrayer_until'] - now)} left")
+    if active_effects:
+        embed.add_field(name="Active Effects", value="\n".join(active_effects), inline=False)
+
+    pending_lines = []
+    if player.get("pending_free_silos", 0) > 0:
+        pending_lines.append(f"🎁 {player['pending_free_silos']} free Missile Silo(s) — place via Build")
+    if player.get("pending_free_ports", 0) > 0:
+        pending_lines.append(f"🎁 {player['pending_free_ports']} free Port(s) — place via Build")
+    if pending_lines:
+        embed.add_field(name="Unclaimed Rewards", value="\n".join(pending_lines), inline=False)
+
     embed.set_footer(text=f" Regeneration/tick happens every {TICK_MINUTES} minutes irl.")
     return embed
 
@@ -448,14 +680,33 @@ def make_grid_embed(member, player, editable=True):
         title=f"{member.display_name}'s Building Stacks",
         color=discord.Color.gold()
     )
+    embed.add_field(name="💰 Gold", value=f"{player['gold']:,}", inline=False)
     for idx, box in enumerate(player["grid"]):
         if box.get("silo", 0) > 0:
-            silo_line = f"🚀 Silo: Loaded ({MISSILE_TYPES[box['missile']]['label']})" if box.get("missile") else "🚀 Silo: Empty"
+            if is_silo_on_cooldown(box):
+                remaining = format_remaining(box["cooldown_until"] - time.time())
+                silo_line = f"🚀 Silo: Cooldown ({remaining})"
+            elif box.get("missile"):
+                silo_line = f"🚀 Silo: Loaded ({MISSILE_TYPES[box['missile']]['label']})"
+            else:
+                silo_line = "🚀 Silo: Empty"
         else:
             silo_line = "🚀 Silo: No"
+
+        sam_level = box.get("sam_level", 0)
+        if sam_level > 0:
+            stock = box.get("sam_stock", 0)
+            if is_sam_on_cooldown(box):
+                remaining = format_remaining(box["sam_cooldown_until"] - time.time())
+                sam_line = f"🛡 SAM Lvl {sam_level}: Cooldown ({remaining}) [{stock}/{sam_level} loaded]"
+            else:
+                sam_line = f"🛡 SAM Lvl {sam_level}: {stock}/{sam_level} loaded"
+        else:
+            sam_line = "🛡 SAM: No"
+
         embed.add_field(
             name=f"Stack {idx + 1}",
-            value=f"🏙 Cities: {box['cities']}\n⚓ Ports: {box['ports']}\n{silo_line}",
+            value=f"🏙 Cities: {box['cities']}\n⚓ Ports: {box['ports']}\n{silo_line}\n{sam_line}",
             inline=True
         )
     embed.add_field(name="Total Cities", value=str(player["cities"]), inline=True)
@@ -495,7 +746,7 @@ class BetraySelectView(discord.ui.View):
         await interaction.response.edit_message(
             content=(
                 f"You betrayed {target.display_name}! Alliance broken — you'll take "
-                f"50% more troop losses whenever someone attacks you for the next 12 hours."
+                f"50% more troop losses whenever someone attacks you for the next 18 hours."
             ),
             view=None
         )
@@ -522,6 +773,13 @@ class AllianceProposalView(discord.ui.View):
             await interaction.response.edit_message(content="One of the players is no longer available.", view=None)
             return
         form_alliance(self.guild_id, self.proposer_id, self.recipient_id, self.days)
+
+        log_embed = discord.Embed(title="🤝 Alliance Formed", color=discord.Color.blue())
+        log_embed.add_field(name="Player A", value=f"<@{self.proposer_id}>", inline=True)
+        log_embed.add_field(name="Player B", value=f"<@{self.recipient_id}>", inline=True)
+        log_embed.add_field(name="Duration", value=f"{self.days} days", inline=True)
+        await send_action_log(self.guild_id, log_embed)
+
         await interaction.response.edit_message(
             content=f"<@{self.recipient_id}> accepted! <@{self.proposer_id}> and <@{self.recipient_id}> are now allied for {self.days} days.",
             view=None
@@ -753,6 +1011,13 @@ class GridBuildView(discord.ui.View):
         stack_price = get_stack_price(stack_count)
         silo_price = get_silo_price(player.get("silos", 0)) if player else 0
         silo_slots_available = bool(player) and any(box.get("silo", 0) == 0 for box in player["grid"])
+        pending_free_silos = player.get("pending_free_silos", 0) if player else 0
+        pending_free_ports = player.get("pending_free_ports", 0) if player else 0
+        free_silo_slots_available = pending_free_silos > 0 and any(box.get("silo", 0) == 0 for box in player["grid"])
+        sam_upgrade_available = bool(player) and any(box.get("sam_level", 0) < SAM_MAX_LEVEL for box in player["grid"])
+        sam_load_available = bool(player) and any(
+            box.get("sam_level", 0) > 0 and box.get("sam_stock", 0) < box.get("sam_level", 0) for box in player["grid"]
+        )
 
         city_btn = discord.ui.Button(label=f"Build City ({city_price:,} gold)", style=discord.ButtonStyle.green, emoji="🏙")
         city_btn.callback = self.pick_city_spot
@@ -766,6 +1031,26 @@ class GridBuildView(discord.ui.View):
             silo_btn = discord.ui.Button(label=f"Build Silo ({silo_price:,} gold)", style=discord.ButtonStyle.blurple, emoji="🚀")
             silo_btn.callback = self.pick_silo_spot
             self.add_item(silo_btn)
+
+        if free_silo_slots_available:
+            free_silo_btn = discord.ui.Button(label=f"Place Free Silo ({pending_free_silos} pending)", style=discord.ButtonStyle.success, emoji="🎁")
+            free_silo_btn.callback = self.pick_free_silo_spot
+            self.add_item(free_silo_btn)
+
+        if pending_free_ports > 0:
+            free_port_btn = discord.ui.Button(label=f"Place Free Port ({pending_free_ports} pending)", style=discord.ButtonStyle.success, emoji="🎁")
+            free_port_btn.callback = self.pick_free_port_spot
+            self.add_item(free_port_btn)
+
+        if sam_upgrade_available:
+            sam_btn = discord.ui.Button(label="Build/Upgrade SAM", style=discord.ButtonStyle.blurple, emoji="🛡")
+            sam_btn.callback = self.open_sam_upgrade
+            self.add_item(sam_btn)
+
+        if sam_load_available:
+            load_sam_btn = discord.ui.Button(label=f"Load SAM ({SAM_INTERCEPTOR_PRICE:,} gold)", style=discord.ButtonStyle.blurple, emoji="🎯")
+            load_sam_btn.callback = self.open_sam_load
+            self.add_item(load_sam_btn)
 
         if stack_price is not None:
             stack_btn = discord.ui.Button(label=f"Buy Stack ({stack_price:,} gold)", style=discord.ButtonStyle.blurple, emoji="📦")
@@ -791,6 +1076,34 @@ class GridBuildView(discord.ui.View):
     async def pick_silo_spot(self, interaction: discord.Interaction):
         await self._open_position_picker(interaction, "silo", "missile silo")
 
+    async def pick_free_silo_spot(self, interaction: discord.Interaction):
+        await self._open_position_picker(interaction, "free_silo", "free missile silo")
+
+    async def pick_free_port_spot(self, interaction: discord.Interaction):
+        await self._open_position_picker(interaction, "free_port", "free port")
+
+    async def open_sam_upgrade(self, interaction: discord.Interaction):
+        player = get_player(self.guild_id, self.user_id)
+        if not is_active_player(player):
+            await interaction.response.send_message("You can't do that rn.", ephemeral=True)
+            return
+        ensure_grid(player)
+        embed = make_grid_embed(interaction.user, player, editable=True)
+        embed.description = "Pick a stack to build or upgrade its SAM."
+        view = SamUpgradePickView(self.guild_id, self.user_id)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    async def open_sam_load(self, interaction: discord.Interaction):
+        player = get_player(self.guild_id, self.user_id)
+        if not is_active_player(player):
+            await interaction.response.send_message("You can't do that rn.", ephemeral=True)
+            return
+        ensure_grid(player)
+        embed = make_grid_embed(interaction.user, player, editable=True)
+        embed.description = "Pick a SAM to load an interceptor into."
+        view = SamLoadPickView(self.guild_id, self.user_id)
+        await interaction.response.edit_message(embed=embed, view=view)
+
     async def buy_stack(self, interaction: discord.Interaction):
         player = get_player(self.guild_id, self.user_id)
         if not is_active_player(player):
@@ -807,7 +1120,7 @@ class GridBuildView(discord.ui.View):
             )
             return
         player["gold"] -= price
-        player["grid"].append({"cities": 0, "ports": 0, "silo": 0, "missile": None})
+        player["grid"].append({"cities": 0, "ports": 0, "silo": 0, "missile": None, "cooldown_until": 0, "sam_level": 0, "sam_stock": 0, "sam_cooldown_until": 0})
         save_data(data)
 
         embed = make_grid_embed(interaction.user, player, editable=True)
@@ -835,6 +1148,157 @@ class GridBuildView(discord.ui.View):
         await interaction.response.edit_message(embed=embed, view=view)
 
 
+class SamUpgradePickView(discord.ui.View):
+    def __init__(self, guild_id, user_id):
+        super().__init__(timeout=120)
+        self.guild_id = guild_id
+        self.user_id = user_id
+
+        player = get_player(guild_id, user_id)
+        ensure_grid(player)
+
+        for idx, box in enumerate(player["grid"]):
+            level = box.get("sam_level", 0)
+            if level >= SAM_MAX_LEVEL:
+                continue
+            price = SAM_PRICES[level]
+            if level == 0:
+                label = f"Stack {idx + 1}: Build Lvl 1 ({price:,}g)"
+            else:
+                label = f"Stack {idx + 1}: Lvl {level}→{level + 1} ({price:,}g)"
+            btn = discord.ui.Button(label=label, style=discord.ButtonStyle.blurple)
+            btn.callback = self._make_callback(idx)
+            self.add_item(btn)
+
+        cancel_btn = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.grey)
+        cancel_btn.callback = self.cancel
+        self.add_item(cancel_btn)
+
+    def _make_callback(self, idx):
+        async def callback(interaction: discord.Interaction):
+            await self.upgrade_at(interaction, idx)
+        return callback
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your hub lil bro.", ephemeral=True)
+            return False
+        return True
+
+    async def upgrade_at(self, interaction: discord.Interaction, idx):
+        player = get_player(self.guild_id, self.user_id)
+        if not is_active_player(player):
+            await interaction.response.send_message("You can't do that rn.", ephemeral=True)
+            return
+        ensure_grid(player)
+        if idx >= len(player["grid"]):
+            await interaction.response.send_message("That stack doesn't exist anymore.", ephemeral=True)
+            return
+        box = player["grid"][idx]
+        level = box.get("sam_level", 0)
+        if level >= SAM_MAX_LEVEL:
+            await interaction.response.send_message("That SAM is already maxed out.", ephemeral=True)
+            return
+        price = SAM_PRICES[level]
+        if player["gold"] < price:
+            await interaction.response.send_message(
+                f"Not enough gold. You need {price:,}, you have {player['gold']:,}.", ephemeral=True
+            )
+            return
+
+        player["gold"] -= price
+        box["sam_level"] = level + 1
+        save_data(data)
+
+        embed = make_grid_embed(interaction.user, player, editable=True)
+        view = GridBuildView(self.guild_id, self.user_id)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    async def cancel(self, interaction: discord.Interaction):
+        player = get_player(self.guild_id, self.user_id)
+        if not is_active_player(player):
+            await interaction.response.edit_message(content="You can't do that rn.", embed=None, view=None)
+            return
+        embed = make_grid_embed(interaction.user, player, editable=True)
+        view = GridBuildView(self.guild_id, self.user_id)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+
+class SamLoadPickView(discord.ui.View):
+    def __init__(self, guild_id, user_id):
+        super().__init__(timeout=120)
+        self.guild_id = guild_id
+        self.user_id = user_id
+
+        player = get_player(guild_id, user_id)
+        ensure_grid(player)
+
+        for idx, box in enumerate(player["grid"]):
+            level = box.get("sam_level", 0)
+            stock = box.get("sam_stock", 0)
+            if level <= 0 or stock >= level:
+                continue
+            btn = discord.ui.Button(label=f"Stack {idx + 1} ({stock}/{level} loaded)", style=discord.ButtonStyle.blurple)
+            btn.callback = self._make_callback(idx)
+            self.add_item(btn)
+
+        cancel_btn = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.grey)
+        cancel_btn.callback = self.cancel
+        self.add_item(cancel_btn)
+
+    def _make_callback(self, idx):
+        async def callback(interaction: discord.Interaction):
+            await self.load_at(interaction, idx)
+        return callback
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your hub lil bro.", ephemeral=True)
+            return False
+        return True
+
+    async def load_at(self, interaction: discord.Interaction, idx):
+        player = get_player(self.guild_id, self.user_id)
+        if not is_active_player(player):
+            await interaction.response.send_message("You can't do that rn.", ephemeral=True)
+            return
+        ensure_grid(player)
+        if idx >= len(player["grid"]):
+            await interaction.response.send_message("That stack doesn't exist anymore.", ephemeral=True)
+            return
+        box = player["grid"][idx]
+        level = box.get("sam_level", 0)
+        stock = box.get("sam_stock", 0)
+        if level <= 0:
+            await interaction.response.send_message("That stack doesn't have a SAM.", ephemeral=True)
+            return
+        if stock >= level:
+            await interaction.response.send_message("That SAM is already fully loaded.", ephemeral=True)
+            return
+        if player["gold"] < SAM_INTERCEPTOR_PRICE:
+            await interaction.response.send_message(
+                f"Not enough gold. You need {SAM_INTERCEPTOR_PRICE:,}, you have {player['gold']:,}.", ephemeral=True
+            )
+            return
+
+        player["gold"] -= SAM_INTERCEPTOR_PRICE
+        box["sam_stock"] = stock + 1
+        save_data(data)
+
+        embed = make_grid_embed(interaction.user, player, editable=True)
+        view = GridBuildView(self.guild_id, self.user_id)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    async def cancel(self, interaction: discord.Interaction):
+        player = get_player(self.guild_id, self.user_id)
+        if not is_active_player(player):
+            await interaction.response.edit_message(content="You can't do that rn.", embed=None, view=None)
+            return
+        embed = make_grid_embed(interaction.user, player, editable=True)
+        view = GridBuildView(self.guild_id, self.user_id)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+
 class BuildPositionView(discord.ui.View):
     def __init__(self, guild_id, user_id, structure_key):
         super().__init__(timeout=120)
@@ -846,7 +1310,7 @@ class BuildPositionView(discord.ui.View):
         ensure_grid(player)
         grid = player["grid"]
 
-        if structure_key == "silo":
+        if structure_key in ("silo", "free_silo"):
             eligible = [i for i, box in enumerate(grid) if box.get("silo", 0) == 0]
         else:
             eligible = list(range(len(grid)))
@@ -879,32 +1343,47 @@ class BuildPositionView(discord.ui.View):
             return
         ensure_grid(player)
 
-        if self.structure_key == "cities":
-            price = get_city_price(player["cities"])
-        elif self.structure_key == "ports":
-            price = get_port_price(player.get("ports", 0))
-        else:
-            price = get_silo_price(player.get("silos", 0))
-
-        if self.structure_key == "silo" and player["grid"][idx].get("silo", 0) > 0:
+        if self.structure_key in ("silo", "free_silo") and player["grid"][idx].get("silo", 0) > 0:
             await interaction.response.send_message("That stack already has a silo — only one per stack.", ephemeral=True)
             return
 
-        if player["gold"] < price:
-            await interaction.response.send_message(
-                f"Not enough gold. You need {price:,}, you have {player['gold']:,}.", ephemeral=True
-            )
-            return
-
-        player["gold"] -= price
-        if self.structure_key == "silo":
+        if self.structure_key == "free_silo":
+            if player.get("pending_free_silos", 0) <= 0:
+                await interaction.response.send_message("You don't have a free silo pending anymore.", ephemeral=True)
+                return
             player["grid"][idx]["silo"] = 1
             player["silos"] = player.get("silos", 0) + 1
+            player["pending_free_silos"] -= 1
+        elif self.structure_key == "free_port":
+            if player.get("pending_free_ports", 0) <= 0:
+                await interaction.response.send_message("You don't have a free port pending anymore.", ephemeral=True)
+                return
+            player["grid"][idx]["ports"] += 1
+            player["ports"] = player.get("ports", 0) + 1
+            player["pending_free_ports"] -= 1
         else:
-            player["grid"][idx][self.structure_key] += 1
-            player[self.structure_key] = player.get(self.structure_key, 0) + 1
             if self.structure_key == "cities":
-                player["troop_cap"] += CITY_TROOP_CAP_BONUS
+                price = get_city_price(player["cities"])
+            elif self.structure_key == "ports":
+                price = get_port_price(player.get("ports", 0))
+            else:
+                price = get_silo_price(player.get("silos", 0))
+
+            if player["gold"] < price:
+                await interaction.response.send_message(
+                    f"Not enough gold. You need {price:,}, you have {player['gold']:,}.", ephemeral=True
+                )
+                return
+
+            player["gold"] -= price
+            if self.structure_key == "silo":
+                player["grid"][idx]["silo"] = 1
+                player["silos"] = player.get("silos", 0) + 1
+            else:
+                player["grid"][idx][self.structure_key] += 1
+                player[self.structure_key] = player.get(self.structure_key, 0) + 1
+                if self.structure_key == "cities":
+                    player["troop_cap"] += CITY_TROOP_CAP_BONUS
         save_data(data)
 
         embed = make_grid_embed(interaction.user, player, editable=True)
@@ -969,8 +1448,12 @@ class LaunchSiloPickView(discord.ui.View):
 
         for idx in silo_indices:
             box = player["grid"][idx]
-            status = "Loaded" if box.get("missile") else "Empty"
-            btn = discord.ui.Button(label=f"Stack {idx + 1} ({status})", style=discord.ButtonStyle.blurple, emoji="🚀")
+            if is_silo_on_cooldown(box):
+                remaining = format_remaining(box["cooldown_until"] - time.time())
+                btn = discord.ui.Button(label=f"Stack {idx + 1} (Cooldown {remaining})", style=discord.ButtonStyle.grey, emoji="🚀", disabled=True)
+            else:
+                status = "Loaded" if box.get("missile") else "Empty"
+                btn = discord.ui.Button(label=f"Stack {idx + 1} ({status})", style=discord.ButtonStyle.blurple, emoji="🚀")
             btn.callback = self._make_callback(idx)
             self.add_item(btn)
 
@@ -997,6 +1480,10 @@ class LaunchSiloPickView(discord.ui.View):
         ensure_grid(player)
         if idx >= len(player["grid"]) or player["grid"][idx].get("silo", 0) <= 0:
             await interaction.response.edit_message(content="That silo isn't there anymore.", view=None)
+            return
+        if is_silo_on_cooldown(player["grid"][idx]):
+            remaining = format_remaining(player["grid"][idx]["cooldown_until"] - time.time())
+            await interaction.response.edit_message(content=f"That silo is on cooldown for {remaining}. Use a different one.", view=None)
             return
 
         loaded_missile = player["grid"][idx].get("missile")
@@ -1055,6 +1542,10 @@ class LaunchMissilePickView(discord.ui.View):
         if self.silo_index >= len(player["grid"]) or player["grid"][self.silo_index].get("silo", 0) <= 0:
             await interaction.response.edit_message(content="That silo isn't there anymore.", view=None)
             return
+        if is_silo_on_cooldown(player["grid"][self.silo_index]):
+            remaining = format_remaining(player["grid"][self.silo_index]["cooldown_until"] - time.time())
+            await interaction.response.edit_message(content=f"That silo is on cooldown for {remaining}. Use a different one.", view=None)
+            return
         if player["grid"][self.silo_index].get("missile"):
             await interaction.response.edit_message(content="That silo already has a missile loaded.", view=None)
             return
@@ -1108,6 +1599,12 @@ class LaunchTargetSelectView(discord.ui.View):
         defender = get_player(self.guild_id, target.id)
         if not is_active_player(defender):
             await interaction.response.edit_message(content=f"{target.display_name} isn't a valid target.", view=None)
+            return
+        if is_immune(defender):
+            remaining = format_remaining(defender["immune_until"] - time.time())
+            await interaction.response.edit_message(
+                content=f"{target.display_name} still has spawn immunity for {remaining}. You can't bomb them yet.", view=None
+            )
             return
         ensure_grid(attacker)
         if self.silo_index >= len(attacker["grid"]) or attacker["grid"][self.silo_index].get("silo", 0) <= 0:
@@ -1229,20 +1726,38 @@ class LaunchStackPickView(discord.ui.View):
         if attacker["grid"][self.silo_index].get("missile") != self.missile_key:
             await interaction.response.edit_message(content="That missile isn't loaded anymore.", view=None)
             return
+        if is_silo_on_cooldown(attacker["grid"][self.silo_index]):
+            remaining = format_remaining(attacker["grid"][self.silo_index]["cooldown_until"] - time.time())
+            await interaction.response.edit_message(content=f"That silo is on cooldown for {remaining}. Use a different one.", view=None)
+            return
         if idx >= len(defender["grid"]):
             await interaction.response.edit_message(content="That stack doesn't exist anymore.", view=None)
             return
 
         attacker["grid"][self.silo_index]["missile"] = None
+        attacker["grid"][self.silo_index]["cooldown_until"] = time.time() + SILO_COOLDOWN_SECONDS
+        attacker["immune_until"] = 0
 
-        cities_destroyed, ports_destroyed, silos_destroyed = resolve_missile_strike(defender, idx)
-        total_destroyed = cities_destroyed + ports_destroyed + silos_destroyed
+        intercepted = try_intercept(defender, idx)
 
-        eliminated = False
-        if defender["troops"] <= 0 and defender["cities"] <= 0:
-            eliminated = True
-            defender["eliminated"] = True
-            defender["alliances"] = {}
+        if intercepted:
+            cities_destroyed = ports_destroyed = silos_destroyed = 0
+            total_destroyed = 0
+            eliminated = False
+            gold_captured = 0
+        else:
+            cities_destroyed, ports_destroyed, silos_destroyed = resolve_missile_strike(defender, idx)
+            total_destroyed = cities_destroyed + ports_destroyed + silos_destroyed
+
+            eliminated = False
+            gold_captured = 0
+            if defender["troops"] <= 0 and defender["cities"] <= 0:
+                eliminated = True
+                defender["eliminated"] = True
+                defender["alliances"] = {}
+                gold_captured = defender["gold"]
+                attacker["gold"] += gold_captured
+                defender["gold"] = 0
 
         save_data(data)
 
@@ -1251,29 +1766,61 @@ class LaunchStackPickView(discord.ui.View):
 
         dm_sent = True
         try:
-            dm_embed = discord.Embed(
-                title=f"{missile_emoji} You've Been Bombed!",
-                description=f"**{self.attacker_member.display_name}** launched a {missile_label} at your Stack {idx + 1}.",
-                color=discord.Color.dark_red()
-            )
-            dm_embed.add_field(name=f"{missile_emoji} Missile Used", value=missile_label, inline=True)
-            dm_embed.add_field(name="🎯 Stack Hit", value=f"Stack {idx + 1}", inline=True)
-            dm_embed.add_field(name="🏙 Structures Lost", value=f"{cities_destroyed} cities, {ports_destroyed} ports, {silos_destroyed} silos", inline=True)
-            if eliminated:
-                dm_embed.add_field(name="💀 Status", value="You have been eliminated and can no longer rejoin.", inline=False)
-            dm_embed.set_footer(text="do /attack or build another silo to retaliate")
+            if intercepted:
+                dm_embed = discord.Embed(
+                    title="🛡 SAM Intercept!",
+                    description=f"Your Stack {idx + 1}'s SAM shot down a {missile_label} launched by **{self.attacker_member.display_name}**!",
+                    color=discord.Color.green()
+                )
+                dm_embed.add_field(name="🎯 Stack Defended", value=f"Stack {idx + 1}", inline=True)
+                dm_embed.set_footer(text="that SAM needs a reload and a cooldown before it can do that again")
+            else:
+                dm_embed = discord.Embed(
+                    title=f"{missile_emoji} You've Been Bombed!",
+                    description=f"**{self.attacker_member.display_name}** launched a {missile_label} at your Stack {idx + 1}.",
+                    color=discord.Color.dark_red()
+                )
+                dm_embed.add_field(name=f"{missile_emoji} Missile Used", value=missile_label, inline=True)
+                dm_embed.add_field(name="🎯 Stack Hit", value=f"Stack {idx + 1}", inline=True)
+                dm_embed.add_field(name="🏙 Structures Lost", value=f"{cities_destroyed} cities, {ports_destroyed} ports, {silos_destroyed} silos", inline=True)
+                if eliminated:
+                    dm_embed.add_field(name="💀 Status", value="You have been eliminated and can no longer rejoin.", inline=False)
+                    if gold_captured > 0:
+                        dm_embed.add_field(name="💰 Gold Looted", value=f"{gold_captured:,}", inline=True)
+                dm_embed.set_footer(text="do /attack or build another silo to retaliate")
             await self.defender_member.send(embed=dm_embed)
         except (discord.Forbidden, discord.HTTPException):
             dm_sent = False
 
-        result_lines = [
-            f"You launched a {missile_label} from Stack {self.silo_index + 1} at {self.defender_member.display_name}'s Stack {idx + 1}.",
-            f"Destroyed {total_destroyed} structure(s) ({cities_destroyed} cities, {ports_destroyed} ports, {silos_destroyed} silos)."
-        ]
+        if intercepted:
+            result_lines = [
+                f"Your {missile_label} from Stack {self.silo_index + 1} was intercepted by {self.defender_member.display_name}'s SAM defense on Stack {idx + 1}!",
+                "No structures were destroyed."
+            ]
+        else:
+            result_lines = [
+                f"You launched a {missile_label} from Stack {self.silo_index + 1} at {self.defender_member.display_name}'s Stack {idx + 1}.",
+                f"Destroyed {total_destroyed} structure(s) ({cities_destroyed} cities, {ports_destroyed} ports, {silos_destroyed} silos)."
+            ]
         if not dm_sent:
             result_lines.append("⚠️ Couldn't DM them (their settings are blocking it) they won't know unless you tell them.")
         if eliminated:
             result_lines.append(f"{self.defender_member.display_name} has been eliminated!")
+            if gold_captured > 0:
+                result_lines.append(f"You looted {gold_captured:,} gold from their fallen empire!")
+
+        log_embed = discord.Embed(title=f"{missile_emoji} Missile Launch", color=discord.Color.green() if intercepted else discord.Color.dark_red())
+        log_embed.add_field(name="Launcher", value=self.attacker_member.mention, inline=True)
+        log_embed.add_field(name="Target", value=self.defender_member.mention, inline=True)
+        log_embed.add_field(name="Missile", value=missile_label, inline=True)
+        log_embed.add_field(name="Stack Hit", value=f"Stack {idx + 1}", inline=True)
+        if intercepted:
+            log_embed.add_field(name="🛡 Intercepted", value="Yes", inline=True)
+        else:
+            log_embed.add_field(name="Structures Destroyed", value=f"{cities_destroyed} cities, {ports_destroyed} ports, {silos_destroyed} silos", inline=True)
+        if eliminated:
+            log_embed.add_field(name="💀 Eliminated", value=f"{self.defender_member.mention} (looted {gold_captured:,} gold)", inline=False)
+        await send_action_log(self.guild_id, log_embed)
 
         await interaction.response.edit_message(content="\n".join(result_lines), view=None)
 
@@ -1305,6 +1852,121 @@ async def gamehub(interaction: discord.Interaction, member: discord.Member = Non
     embed = make_hub_embed(interaction.user, player)
     view = GameHubView(interaction.guild_id, interaction.user.id)
     await interaction.response.send_message(embed=embed, view=view)
+
+
+def make_streak_embed(member, player):
+    streak_number = player.get("streak_number", 0)
+    claimed_days = set(player.get("streak_claimed_days", []))
+    embed = discord.Embed(title=f"{member.display_name}'s Daily Streak", color=discord.Color.gold())
+    embed.add_field(name="Current Streak", value=f"{streak_number} day{'s' if streak_number != 1 else ''}", inline=False)
+    for day in range(1, 8):
+        if day > streak_number:
+            status = "🔒 Locked"
+        elif day in claimed_days:
+            status = "✅ Claimed"
+        else:
+            status = "🎁 Ready to claim!"
+        embed.add_field(name=f"Day {day}", value=f"{get_streak_reward_label(day)}\n{status}", inline=True)
+    bonus_available = max(0, streak_number - 7) - player.get("streak_bonus_claimed", 0)
+    if streak_number > 7:
+        bonus_status = f"🎁 {bonus_available} pending!" if bonus_available > 0 else "✅ Up to date"
+    else:
+        bonus_status = "🔒 Locked bruh"
+    embed.add_field(name="Day 7+", value=f"{STREAK_BONUS_GOLD:,} gold each\n{bonus_status}", inline=True)
+    embed.set_footer(text="Do at least one command each day (by 10 PM UTC) to keep your streak going.")
+    return embed
+
+
+class StreakRewardsView(discord.ui.View):
+    def __init__(self, guild_id, user_id):
+        super().__init__(timeout=120)
+        self.guild_id = guild_id
+        self.user_id = user_id
+
+        player = get_player(guild_id, user_id)
+        streak_number = player.get("streak_number", 0) if player else 0
+        claimed_days = set(player.get("streak_claimed_days", [])) if player else set()
+
+        for day in range(1, 8):
+            if day <= streak_number and day not in claimed_days:
+                btn = discord.ui.Button(label=f"Claim Day {day}", style=discord.ButtonStyle.green, row=(day - 1) // 4)
+                btn.callback = self._make_callback(day)
+                self.add_item(btn)
+
+        bonus_available = max(0, streak_number - 7) - (player.get("streak_bonus_claimed", 0) if player else 0)
+        if bonus_available > 0:
+            bonus_btn = discord.ui.Button(label=f"Claim Day 7+ ({bonus_available} pending)", style=discord.ButtonStyle.green, row=2)
+            bonus_btn.callback = self.claim_bonus
+            self.add_item(bonus_btn)
+
+    def _make_callback(self, day):
+        async def callback(interaction: discord.Interaction):
+            await self.claim_day(interaction, day)
+        return callback
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your streak menu.", ephemeral=True)
+            return False
+        return True
+
+    async def claim_day(self, interaction: discord.Interaction, day):
+        player = get_player(self.guild_id, self.user_id)
+        if not is_active_player(player):
+            await interaction.response.send_message("You can't do that rn.", ephemeral=True)
+            return
+        claimed_days = player.setdefault("streak_claimed_days", [])
+        if day > player.get("streak_number", 0):
+            await interaction.response.send_message("You haven't unlocked that day yet.", ephemeral=True)
+            return
+        if day in claimed_days:
+            await interaction.response.send_message("You already claimed that day.", ephemeral=True)
+            return
+
+        apply_streak_reward(player, day)
+        claimed_days.append(day)
+        save_data(data)
+
+        embed = make_streak_embed(interaction.user, player)
+        view = StreakRewardsView(self.guild_id, self.user_id)
+        await interaction.response.edit_message(
+            content=f"Claimed Day {day}: {get_streak_reward_label(day)}!",
+            embed=embed,
+            view=view
+        )
+
+    async def claim_bonus(self, interaction: discord.Interaction):
+        player = get_player(self.guild_id, self.user_id)
+        if not is_active_player(player):
+            await interaction.response.send_message("You can't do that rn.", ephemeral=True)
+            return
+        available = max(0, player.get("streak_number", 0) - 7) - player.get("streak_bonus_claimed", 0)
+        if available <= 0:
+            await interaction.response.send_message("Nothing pending to claim.", ephemeral=True)
+            return
+
+        apply_streak_reward(player, 8)
+        player["streak_bonus_claimed"] = player.get("streak_bonus_claimed", 0) + 1
+        save_data(data)
+
+        embed = make_streak_embed(interaction.user, player)
+        view = StreakRewardsView(self.guild_id, self.user_id)
+        await interaction.response.edit_message(
+            content=f"Claimed a Day 7+ bonus: {STREAK_BONUS_GOLD:,} gold!",
+            embed=embed,
+            view=view
+        )
+
+
+@bot.tree.command(name="streakrewards", description="View and claim your daily streak rewards")
+async def streakrewards(interaction: discord.Interaction):
+    player = get_player(interaction.guild_id, interaction.user.id)
+    if not is_active_player(player):
+        await interaction.response.send_message("You need to /joingame first.", ephemeral=True)
+        return
+    embed = make_streak_embed(interaction.user, player)
+    view = StreakRewardsView(interaction.guild_id, interaction.user.id)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
 @bot.tree.command(name="leaderboard", description="See the leaderboard")
@@ -1378,11 +2040,15 @@ class AttackView(discord.ui.View):
             await interaction.response.edit_message(content="You don't have enough troops to send.", embed=None, view=None)
             return
 
+        attacker["immune_until"] = 0
+
         defender_troops_before = defender["troops"]
 
         defender_loss_rate = random.uniform(DEFENDER_LOSS_MIN, DEFENDER_LOSS_MAX)
         if is_betrayer(defender):
             defender_loss_rate *= BETRAYER_LOSS_MULTIPLIER
+        if is_attack_buffed(attacker):
+            defender_loss_rate *= ATTACK_BUFF_DAMAGE_MULTIPLIER
         troop_loss = round(attack_troops * defender_loss_rate)
         defender["troops"] = max(0, defender["troops"] - troop_loss)
 
@@ -1390,22 +2056,47 @@ class AttackView(discord.ui.View):
         attacker_loss = round(attack_troops * attacker_loss_rate)
         attacker["troops"] = max(0, attacker["troops"] - attacker_loss)
 
-        capture_chance = HIGH_CAPTURE_CHANCE if defender_troops_before < attack_troops else BASE_CAPTURE_CHANCE
-        captured_city = False
-        if defender["cities"] > 0 and random.random() < capture_chance:
-            captured_city = True
-            defender["cities"] -= 1
-            defender["troop_cap"] = max(STARTING_TROOP_CAP, defender["troop_cap"] - CITY_TROOP_CAP_BONUS)
-            defender["troops"] = min(defender["troops"], defender["troop_cap"])
-            attacker["cities"] += 1
-            attacker["troop_cap"] += CITY_TROOP_CAP_BONUS
-            transfer_structure_box(attacker, defender, "cities")
+        defender_id = str(self.defender_member.id)
+        streaks = attacker.setdefault("zero_troop_streaks", {})
+        cities_captured = 0
+
+        if defender_troops_before <= 0:
+            streak = streaks.get(defender_id, 0)
+            capture_cap = ZERO_TROOP_CAPTURE_BASE + streak
+            for _ in range(capture_cap):
+                if defender["cities"] <= 0:
+                    break
+                if random.random() < HIGH_CAPTURE_CHANCE:
+                    cities_captured += 1
+                    defender["cities"] -= 1
+                    defender["troop_cap"] = max(STARTING_TROOP_CAP, defender["troop_cap"] - CITY_TROOP_CAP_BONUS)
+                    attacker["cities"] += 1
+                    attacker["troop_cap"] += CITY_TROOP_CAP_BONUS
+                    transfer_structure_box(attacker, defender, "cities")
+            streaks[defender_id] = streak + 1
+        else:
+            streaks[defender_id] = 0
+            capture_chance = HIGH_CAPTURE_CHANCE if defender_troops_before < attack_troops else BASE_CAPTURE_CHANCE
+            if defender["cities"] > 0 and random.random() < capture_chance:
+                cities_captured = 1
+                defender["cities"] -= 1
+                defender["troop_cap"] = max(STARTING_TROOP_CAP, defender["troop_cap"] - CITY_TROOP_CAP_BONUS)
+                attacker["cities"] += 1
+                attacker["troop_cap"] += CITY_TROOP_CAP_BONUS
+                transfer_structure_box(attacker, defender, "cities")
+
+        defender["troops"] = min(defender["troops"], defender["troop_cap"])
+        captured_city = cities_captured > 0
 
         eliminated = False
+        gold_captured = 0
         if defender["troops"] <= 0 and defender["cities"] <= 0:
             eliminated = True
             defender["eliminated"] = True
             defender["alliances"] = {}
+            gold_captured = defender["gold"]
+            attacker["gold"] += gold_captured
+            defender["gold"] = 0
 
         save_data(data)
 
@@ -1418,9 +2109,11 @@ class AttackView(discord.ui.View):
             )
             dm_embed.add_field(name="🪖 Troops Sent Against You", value=f"{attack_troops:,}", inline=True)
             dm_embed.add_field(name="💥 Troops You Lost", value=f"{troop_loss:,}", inline=True)
-            dm_embed.add_field(name="🏙 Structures Lost", value=str(1 if captured_city else 0), inline=True)
+            dm_embed.add_field(name="🏙 Structures Lost", value=str(cities_captured), inline=True)
             if eliminated:
                 dm_embed.add_field(name="💀 Status", value="You have been eliminated and can no longer rejoin.", inline=False)
+                if gold_captured > 0:
+                    dm_embed.add_field(name="💰 Gold Looted", value=f"{gold_captured:,}", inline=True)
             dm_embed.set_footer(text="do /attack to retaliate")
             await self.defender_member.send(embed=dm_embed)
         except (discord.Forbidden, discord.HTTPException):
@@ -1434,9 +2127,26 @@ class AttackView(discord.ui.View):
         if not dm_sent:
             result_lines.append("⚠️ Couldn't DM them (their settings are blocking it) they won't know unless you tell them hehe.")
         if captured_city:
-            result_lines.append("You captured one of their cities W attack gng")
+            if cities_captured == 1:
+                result_lines.append("You captured one of their cities W attack gng")
+            else:
+                result_lines.append(f"You captured {cities_captured} of their cities W attack gng")
         if eliminated:
             result_lines.append(f"{self.defender_member.display_name} has been eliminated!")
+            if gold_captured > 0:
+                result_lines.append(f"You looted {gold_captured:,} gold from their fallen empire!")
+
+        log_embed = discord.Embed(title="⚔️ Attack", color=discord.Color.orange())
+        log_embed.add_field(name="Attacker", value=self.attacker_member.mention, inline=True)
+        log_embed.add_field(name="Defender", value=self.defender_member.mention, inline=True)
+        log_embed.add_field(name="Troops Sent", value=f"{attack_troops:,}", inline=True)
+        log_embed.add_field(name="Troops Lost (Defender)", value=f"{troop_loss:,}", inline=True)
+        log_embed.add_field(name="Troops Lost (Attacker)", value=f"{attacker_loss:,}", inline=True)
+        if captured_city:
+            log_embed.add_field(name="Cities Captured", value=str(cities_captured), inline=True)
+        if eliminated:
+            log_embed.add_field(name="💀 Eliminated", value=f"{self.defender_member.mention} (looted {gold_captured:,} gold)", inline=False)
+        await send_action_log(self.guild_id, log_embed)
 
         await interaction.response.edit_message(content="\n".join(result_lines), embed=None, view=None)
 class BetrayConfirmView(discord.ui.View):
@@ -1497,6 +2207,12 @@ async def attack(interaction: discord.Interaction, target: discord.Member):
     if not is_active_player(defender):
         await interaction.response.send_message(f"{target.display_name} isn't a valid target.", ephemeral=True)
         return
+    if is_immune(defender):
+        remaining = format_remaining(defender["immune_until"] - time.time())
+        await interaction.response.send_message(
+            f"{target.display_name} still has spawn immunity for {remaining}. You can't attack them yet.", ephemeral=True
+        )
+        return
     if attacker["troops"] <= 0:
         await interaction.response.send_message("You have no troops to attack with.", ephemeral=True)
         return
@@ -1527,8 +2243,12 @@ async def attack(interaction: discord.Interaction, target: discord.Member):
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 @bot.tree.command(name="adminrevive", description="(Admins) Revive player back")
-@discord.app_commands.checks.has_permissions(manage_guild=True)
 async def adminrevive(interaction: discord.Interaction, target: discord.Member):
+    if not has_admin_access(interaction):
+        await interaction.response.send_message("❌ You need Manage Server permission to use this.", ephemeral=True)
+        return
+    bypass = is_owner_bypass(interaction)
+
     player = get_player(interaction.guild_id, target.id)
     if player is None:
         await interaction.response.send_message(
@@ -1542,21 +2262,16 @@ async def adminrevive(interaction: discord.Interaction, target: discord.Member):
     player["cities"] = 0
     player["ports"] = 0
     player["silos"] = 0
-    player["grid"] = [{"cities": 0, "ports": 0, "silo": 0, "missile": None} for _ in range(STARTING_STACK_COUNT)]
+    player["grid"] = [{"cities": 0, "ports": 0, "silo": 0, "missile": None, "cooldown_until": 0, "sam_level": 0, "sam_stock": 0, "sam_cooldown_until": 0} for _ in range(STARTING_STACK_COUNT)]
     player["eliminated"] = False
+    player["immune_until"] = time.time() + SPAWN_IMMUNITY_SECONDS
     save_data(data)
 
     await interaction.response.send_message(
         f"✅ {target.mention} has been revived with a fresh empire "
-        f"({STARTING_TROOPS} troops, cap {STARTING_TROOP_CAP}, 0 gold, 0 cities)."
+        f"({STARTING_TROOPS} troops, cap {STARTING_TROOP_CAP}, 0 gold, 0 cities).",
+        ephemeral=bypass
     )
-
-@adminrevive.error
-async def adminrevive_error(interaction: discord.Interaction, error):
-    if isinstance(error, discord.app_commands.MissingPermissions):
-        await interaction.response.send_message("❌ You need Manage Server permission to use this.", ephemeral=True)
-    else:
-        await interaction.response.send_message(f"⚠️ Something went wrong: {error}", ephemeral=True)
 
 @bot.tree.command(name="admingive", description="(Admins) Give or take troops/gold from a player")
 @discord.app_commands.describe(target="Who to give to", resource="Troops or gold", amount="Amount (use a negative number to take away)")
@@ -1564,8 +2279,12 @@ async def adminrevive_error(interaction: discord.Interaction, error):
     discord.app_commands.Choice(name="Troops", value="troops"),
     discord.app_commands.Choice(name="Gold", value="gold"),
 ])
-@discord.app_commands.checks.has_permissions(manage_guild=True)
 async def admingive(interaction: discord.Interaction, target: discord.Member, resource: discord.app_commands.Choice[str], amount: int):
+    if not has_admin_access(interaction):
+        await interaction.response.send_message("❌ You need Manage Server permission to use this.", ephemeral=True)
+        return
+    bypass = is_owner_bypass(interaction)
+
     player = get_player(interaction.guild_id, target.id)
     if not is_active_player(player):
         await interaction.response.send_message(f"{target.display_name} isn't an active player.", ephemeral=True)
@@ -1575,21 +2294,16 @@ async def admingive(interaction: discord.Interaction, target: discord.Member, re
         player["troops"] = max(0, min(player["troops"] + amount, player["troop_cap"]))
         save_data(data)
         await interaction.response.send_message(
-            f"✅ {target.mention}'s troops are now {player['troops']:,} / {player['troop_cap']:,}."
+            f"✅ {target.mention}'s troops are now {player['troops']:,} / {player['troop_cap']:,}.",
+            ephemeral=bypass
         )
     else:
         player["gold"] = max(0, player["gold"] + amount)
         save_data(data)
         await interaction.response.send_message(
-            f"✅ {target.mention}'s gold is now {player['gold']:,}."
+            f"✅ {target.mention}'s gold is now {player['gold']:,}.",
+            ephemeral=bypass
         )
-
-@admingive.error
-async def admingive_error(interaction: discord.Interaction, error):
-    if isinstance(error, discord.app_commands.MissingPermissions):
-        await interaction.response.send_message("❌ You need Manage Server permission to use this.", ephemeral=True)
-    else:
-        await interaction.response.send_message(f"⚠️ Something went wrong: {error}", ephemeral=True)
 
 class RestartConfirmView(discord.ui.View):
     def __init__(self, guild_id):
@@ -1611,8 +2325,11 @@ class RestartConfirmView(discord.ui.View):
         await interaction.response.edit_message(content="Cancelled — nothing was reset.", view=None)
 
 @bot.tree.command(name="adminrestart", description="(Admins) Wipe everyone and restart the game")
-@discord.app_commands.checks.has_permissions(manage_guild=True)
 async def adminrestart(interaction: discord.Interaction):
+    if not has_admin_access(interaction):
+        await interaction.response.send_message("❌ You need Manage Server permission to use this.", ephemeral=True)
+        return
+
     view = RestartConfirmView(interaction.guild_id)
     await interaction.response.send_message(
         "⚠️ This will wipe **everyone's** troops, gold, cities, and alliances in this server. "
@@ -1621,18 +2338,14 @@ async def adminrestart(interaction: discord.Interaction):
         ephemeral=True
     )
 
-@adminrestart.error
-async def adminrestart_error(interaction: discord.Interaction, error):
-    if isinstance(error, discord.app_commands.MissingPermissions):
-        await interaction.response.send_message("❌ You need Manage Server permission to use this.", ephemeral=True)
-    else:
-        await interaction.response.send_message(f"⚠️ Something went wrong: {error}", ephemeral=True)
-
 
 @bot.tree.command(name="botstatus", description="(Admins) Set a channel to show a live bot online/offline status")
 @discord.app_commands.describe(channel="Which channel should show the bot's status?")
-@discord.app_commands.checks.has_permissions(manage_guild=True)
 async def botstatus(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not has_admin_access(interaction):
+        await interaction.response.send_message("❌ You need Manage Server permission to use this.", ephemeral=True)
+        return
+
     message = await channel.send(embed=make_status_embed(True))
 
     guild_dict = get_guild_dict(interaction.guild_id)
@@ -1642,12 +2355,19 @@ async def botstatus(interaction: discord.Interaction, channel: discord.TextChann
 
     await interaction.response.send_message(f"✅ Status will now show in {channel.mention} and update itself on startup/shutdown.", ephemeral=True)
 
-@botstatus.error
-async def botstatus_error(interaction: discord.Interaction, error):
-    if isinstance(error, discord.app_commands.MissingPermissions):
+
+@bot.tree.command(name="channellog", description="(Admins) Set a channel for action logs (attacks, missiles, eliminations, alliances)")
+@discord.app_commands.describe(channel="Which channel should receive the logs?")
+async def channellog(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not has_admin_access(interaction):
         await interaction.response.send_message("❌ You need Manage Server permission to use this.", ephemeral=True)
-    else:
-        await interaction.response.send_message(f"⚠️ Something went wrong: {error}", ephemeral=True)
+        return
+
+    guild_dict = get_guild_dict(interaction.guild_id)
+    guild_dict["log_channel_id"] = channel.id
+    save_data(data)
+
+    await interaction.response.send_message(f"✅ Action logs will now be posted in {channel.mention}.", ephemeral=True)
 
 
 async def main():
