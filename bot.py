@@ -50,6 +50,8 @@ CLAN_TAG_MIN_LEN = 2
 CLAN_TAG_MAX_LEN = 10
 CLAN_DESC_MAX_LEN = 200
 CLANS_PER_PAGE = 10
+CLAN_MEMBERS_PER_PAGE = 10
+CLAN_BANK_CAP = 30000
 SPAWN_IMMUNITY_SECONDS = 6 * 3600
 ATTACK_BUFF_DAMAGE_MULTIPLIER = 1.5
 ATTACK_BUFF_DURATION_SECONDS = 6 * 3600
@@ -144,6 +146,24 @@ def find_clan_for_user(user_id):
     return None, None
 
 
+def get_clan_bank_dict(clan):
+    bank = clan.get("bank")
+    if not isinstance(bank, dict):
+        clan["bank"] = {}
+        bank = clan["bank"]
+    return bank
+
+
+def get_clan_bank(clan, guild_id):
+    return get_clan_bank_dict(clan).get(str(guild_id), 0)
+
+
+def add_clan_bank(clan, guild_id, amount):
+    bank = get_clan_bank_dict(clan)
+    gid = str(guild_id)
+    bank[gid] = bank.get(gid, 0) + amount
+
+
 def total_troops_for_user(user_id):
     uid = str(user_id)
     total = 0
@@ -187,21 +207,44 @@ def make_clan_directory_embed(page, query=None):
     return embed, page, total_pages
 
 
-def make_clan_hub_embed(guild_id, tag, clan):
+def make_clan_hub_embed(guild_id, tag, clan, page=0):
     leader_id = clan.get("leader_id")
+    members = clan.get("members", [])
+
+    def rank_key(uid):
+        p = get_player(guild_id, uid)
+        if not is_active_player(p):
+            return -1
+        return p.get("troops", 0)
+
+    ranked = sorted(members, key=rank_key, reverse=True)
+    total_pages = max(1, (len(ranked) + CLAN_MEMBERS_PER_PAGE - 1) // CLAN_MEMBERS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * CLAN_MEMBERS_PER_PAGE
+    page_members = ranked[start:start + CLAN_MEMBERS_PER_PAGE]
+
     embed = discord.Embed(title=f"🏰 [{tag}] Clan Hub", color=discord.Color.dark_gold())
     embed.description = clan.get("description", "(no description)")
     status = "🔒 Invite Only" if clan.get("invite_only") else "🌐 Public"
     embed.add_field(name="Status", value=status, inline=True)
-    embed.add_field(name="Members", value=str(len(clan.get("members", []))), inline=True)
-    embed.add_field(name="Clan Bank", value=f"{clan.get('bank', 0):,} troops", inline=True)
+    embed.add_field(name="Members", value=str(len(members)), inline=True)
+    bank_amount = get_clan_bank(clan, guild_id)
+    embed.add_field(name="Clan Bank (this server)", value=f"{bank_amount:,} / {CLAN_BANK_CAP:,} troops", inline=True)
     embed.add_field(name="Leader", value=f"<@{leader_id}>", inline=False)
 
-    ranked = sorted(clan.get("members", []), key=lambda uid: total_troops_for_user(uid), reverse=True)
-    top_lines = [f"<@{uid}> — {total_troops_for_user(uid):,} troops" for uid in ranked[:5]]
-    if top_lines:
-        embed.add_field(name="Top Members", value="\n".join(top_lines), inline=False)
-    return embed
+    member_lines = []
+    for uid in page_members:
+        p = get_player(guild_id, uid)
+        if is_active_player(p):
+            member_lines.append(f"<@{uid}> — {p.get('troops', 0):,} troops")
+        else:
+            member_lines.append(f"<@{uid}> — None")
+    embed.add_field(
+        name=f"Members in this server (Page {page + 1}/{total_pages})",
+        value="\n".join(member_lines) if member_lines else "No members.",
+        inline=False
+    )
+    return embed, page, total_pages
 
 
 def create_player(guild_id, user_id):
@@ -2123,6 +2166,9 @@ async def leaderboard(interaction: discord.Interaction):
             except discord.NotFound:
                 member = None
         name = member.display_name if member else f"User {user_id}"
+        clan_tag, _ = find_clan_for_user(user_id)
+        if clan_tag:
+            name += f" [{clan_tag}]"
         if pdata.get("eliminated"):
             name += " (eliminated)"
         lines.append(f"{rank_icon} {name} — Troops: {pdata['troops']:,}/{pdata['troop_cap']:,} | Gold: {pdata['gold']:,}")
@@ -2541,7 +2587,7 @@ class ClanVisibilityView(discord.ui.View):
             "invite_only": invite_only,
             "leader_id": str(self.leader_id),
             "members": [str(self.leader_id)],
-            "bank": 0,
+            "bank": {},
             "pending_invites": [],
             "created_at": time.time()
         }
@@ -2823,11 +2869,12 @@ class ClanJoinBrowseView(discord.ui.View):
 class ClanDepositModal(discord.ui.Modal, title="Deposit Troops"):
     amount_input = discord.ui.TextInput(label="Amount to deposit", placeholder="e.g. 500")
 
-    def __init__(self, guild_id, user_id, tag):
+    def __init__(self, guild_id, user_id, tag, page=0):
         super().__init__()
         self.guild_id = guild_id
         self.user_id = user_id
         self.tag = tag
+        self.page = page
 
     async def on_submit(self, interaction: discord.Interaction):
         raw = self.amount_input.value.strip()
@@ -2855,23 +2902,33 @@ class ClanDepositModal(discord.ui.Modal, title="Deposit Troops"):
             await interaction.response.send_message(f"You only have {player['troops']:,} troops.", ephemeral=True)
             return
 
+        current_bank = get_clan_bank(clan, self.guild_id)
+        room = CLAN_BANK_CAP - current_bank
+        if amount > room:
+            await interaction.response.send_message(
+                f"This server's clan bank only has room for {room:,} more troops (cap {CLAN_BANK_CAP:,}).",
+                ephemeral=True
+            )
+            return
+
         player["troops"] -= amount
-        clan["bank"] = clan.get("bank", 0) + amount
+        add_clan_bank(clan, self.guild_id, amount)
         save_data(data)
 
-        embed = make_clan_hub_embed(self.guild_id, self.tag, clan)
-        view = ClanHubView(self.guild_id, self.user_id, self.tag)
+        embed, page, total_pages = make_clan_hub_embed(self.guild_id, self.tag, clan, self.page)
+        view = ClanHubView(self.guild_id, self.user_id, self.tag, page)
         await interaction.response.edit_message(embed=embed, view=view)
 
 
 class ClanWithdrawModal(discord.ui.Modal, title="Withdraw Troops"):
     amount_input = discord.ui.TextInput(label="Amount to withdraw", placeholder="e.g. 500")
 
-    def __init__(self, guild_id, user_id, tag):
+    def __init__(self, guild_id, user_id, tag, page=0):
         super().__init__()
         self.guild_id = guild_id
         self.user_id = user_id
         self.tag = tag
+        self.page = page
 
     async def on_submit(self, interaction: discord.Interaction):
         raw = self.amount_input.value.strip()
@@ -2888,8 +2945,11 @@ class ClanWithdrawModal(discord.ui.Modal, title="Withdraw Troops"):
             await interaction.response.send_message("You're not in that clan anymore.", ephemeral=True)
             return
 
-        if clan.get("bank", 0) < amount:
-            await interaction.response.send_message(f"The clan bank only has {clan.get('bank', 0):,} troops.", ephemeral=True)
+        current_bank = get_clan_bank(clan, self.guild_id)
+        if current_bank < amount:
+            await interaction.response.send_message(
+                f"This server's clan bank only has {current_bank:,} troops.", ephemeral=True
+            )
             return
 
         player = get_player(self.guild_id, self.user_id)
@@ -2906,21 +2966,22 @@ class ClanWithdrawModal(discord.ui.Modal, title="Withdraw Troops"):
             )
             return
 
-        clan["bank"] -= amount
+        add_clan_bank(clan, self.guild_id, -amount)
         player["troops"] += amount
         save_data(data)
 
-        embed = make_clan_hub_embed(self.guild_id, self.tag, clan)
-        view = ClanHubView(self.guild_id, self.user_id, self.tag)
+        embed, page, total_pages = make_clan_hub_embed(self.guild_id, self.tag, clan, self.page)
+        view = ClanHubView(self.guild_id, self.user_id, self.tag, page)
         await interaction.response.edit_message(embed=embed, view=view)
 
 
 class ClanLeaveConfirmView(discord.ui.View):
-    def __init__(self, guild_id, user_id, tag):
+    def __init__(self, guild_id, user_id, tag, page=0):
         super().__init__(timeout=60)
         self.guild_id = guild_id
         self.user_id = user_id
         self.tag = tag
+        self.page = page
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.user_id:
@@ -2965,17 +3026,18 @@ class ClanLeaveConfirmView(discord.ui.View):
         if clan is None or str(self.user_id) not in clan.get("members", []):
             await interaction.response.edit_message(content="You're not in that clan anymore.", embed=None, view=None)
             return
-        embed = make_clan_hub_embed(self.guild_id, self.tag, clan)
-        view = ClanHubView(self.guild_id, self.user_id, self.tag)
+        embed, page, total_pages = make_clan_hub_embed(self.guild_id, self.tag, clan, self.page)
+        view = ClanHubView(self.guild_id, self.user_id, self.tag, page)
         await interaction.response.edit_message(embed=embed, view=view)
 
 
 class ClanHubView(discord.ui.View):
-    def __init__(self, guild_id, user_id, tag):
+    def __init__(self, guild_id, user_id, tag, page=0):
         super().__init__(timeout=180)
         self.guild_id = guild_id
         self.user_id = user_id
         self.tag = tag
+        self.page = page
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.user_id:
@@ -2983,32 +3045,52 @@ class ClanHubView(discord.ui.View):
             return False
         return True
 
-    @discord.ui.button(label="Deposit Troops", style=discord.ButtonStyle.success, emoji="📥")
+    @discord.ui.button(label="Deposit Troops", style=discord.ButtonStyle.success, emoji="📥", row=0)
     async def deposit_clicked(self, interaction: discord.Interaction, button: discord.ui.Button):
         clan = get_clan(self.tag)
         if clan is None or str(self.user_id) not in clan.get("members", []):
             await interaction.response.edit_message(content="You're not in that clan anymore.", embed=None, view=None)
             return
-        await interaction.response.send_modal(ClanDepositModal(self.guild_id, self.user_id, self.tag))
+        await interaction.response.send_modal(ClanDepositModal(self.guild_id, self.user_id, self.tag, self.page))
 
-    @discord.ui.button(label="Withdraw Troops", style=discord.ButtonStyle.primary, emoji="📤")
+    @discord.ui.button(label="Withdraw Troops", style=discord.ButtonStyle.primary, emoji="📤", row=0)
     async def withdraw_clicked(self, interaction: discord.Interaction, button: discord.ui.Button):
         clan = get_clan(self.tag)
         if clan is None or str(self.user_id) not in clan.get("members", []):
             await interaction.response.edit_message(content="You're not in that clan anymore.", embed=None, view=None)
             return
-        await interaction.response.send_modal(ClanWithdrawModal(self.guild_id, self.user_id, self.tag))
+        await interaction.response.send_modal(ClanWithdrawModal(self.guild_id, self.user_id, self.tag, self.page))
 
-    @discord.ui.button(label="Leave Clan", style=discord.ButtonStyle.danger, emoji="🚪")
+    @discord.ui.button(label="Leave Clan", style=discord.ButtonStyle.danger, emoji="🚪", row=0)
     async def leave_clicked(self, interaction: discord.Interaction, button: discord.ui.Button):
         clan = get_clan(self.tag)
         if clan is None or str(self.user_id) not in clan.get("members", []):
             await interaction.response.edit_message(content="You're not in that clan anymore.", embed=None, view=None)
             return
-        view = ClanLeaveConfirmView(self.guild_id, self.user_id, self.tag)
+        view = ClanLeaveConfirmView(self.guild_id, self.user_id, self.tag, self.page)
         await interaction.response.edit_message(
             content=f"Are you sure you want to leave [{self.tag}]?", embed=None, view=view
         )
+
+    @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary, row=1)
+    async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        clan = get_clan(self.tag)
+        if clan is None or str(self.user_id) not in clan.get("members", []):
+            await interaction.response.edit_message(content="You're not in that clan anymore.", embed=None, view=None)
+            return
+        self.page -= 1
+        embed, self.page, total_pages = make_clan_hub_embed(self.guild_id, self.tag, clan, self.page)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="▶ Next", style=discord.ButtonStyle.secondary, row=1)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        clan = get_clan(self.tag)
+        if clan is None or str(self.user_id) not in clan.get("members", []):
+            await interaction.response.edit_message(content="You're not in that clan anymore.", embed=None, view=None)
+            return
+        self.page += 1
+        embed, self.page, total_pages = make_clan_hub_embed(self.guild_id, self.tag, clan, self.page)
+        await interaction.response.edit_message(embed=embed, view=self)
 
 
 class ClanCenterView(discord.ui.View):
@@ -3062,8 +3144,8 @@ class ClanCenterView(discord.ui.View):
         if clan is None:
             await interaction.response.send_message("You're not in a clan yet. Use Create Clan or Join Clan first.", ephemeral=True)
             return
-        embed = make_clan_hub_embed(self.guild_id, tag, clan)
-        view = ClanHubView(self.guild_id, self.user_id, tag)
+        embed, page, total_pages = make_clan_hub_embed(self.guild_id, tag, clan)
+        view = ClanHubView(self.guild_id, self.user_id, tag, page)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
