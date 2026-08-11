@@ -16,12 +16,11 @@ STARTING_TROOP_CAP = 5000
 TROOP_REGEN_FLOOR = 1.1
 TROOP_REGEN_MULTIPLIER = 1.5
 CITY_TROOP_CAP_BONUS = 1500
-CITY_PRICES = [250, 500, 500, 750, 1000, 1000, 1500, 1500, 2000, 2000, 2000, 5000, 5000, 5000, 5000, 5000, 7000, 7000, 7000, 7000, 10000]
+CITY_PRICES = [250, 250, 250, 500, 500, 500, 750, 750, 750, 1000, 1000, 1250, 1500, 1500, 1500, 2000, 2000, 2000, 5000, 5000, 5000, 5000, 5000, 7000, 7000, 7000, 7000, 10000, 10000, 10000, 10000, 10000, 12500, 12500, 15000, 15000, 17500, 17500, 20000]
 BASE_GOLD_REGEN = 20
-GOLD_REGEN_PER_CITY = 5
-PORT_PRICES = [500, 750, 1000, 1000, 1500, 1500, 2000, 2000, 2000, 5000, 5000, 5000, 5000, 5000, 7500, 7500, 7500, 7500, 10000]
+GOLD_REGEN_PER_CITY = 7
+PORT_PRICES = [250, 250, 250, 500, 500, 500, 1000, 1000, 1000, 1500, 2000, 2000, 2000, 3000, 3000, 3000, 4000, 4000, 4000, 5000, 5000, 5000, 7500, 7500, 7500, 7500, 7500, 10000, 10000, 10000, 10000, 10000, 10000, 10000, 15000, 15000, 15000, 20000]
 PORT_GOLD_REGEN_PER_PORT = 20
-PORT_ALLIANCE_BONUS_PERCENT = 20
 STARTING_STACK_COUNT = 3
 MAX_STACK_COUNT = 6
 STACK_PRICES = [20000, 40000, 65000]
@@ -374,7 +373,12 @@ def active_alliance_count(player, now=None):
 
 def port_earnings_per_port(player, now=None):
     n = active_alliance_count(player, now)
-    percent = 100 + (PORT_ALLIANCE_BONUS_PERCENT * n)
+    if n <= 2:
+        percent = 100 + (20 * n)
+    elif n <= 6:
+        percent = 140 + (15 * (n - 2))
+    else:
+        percent = 200 + (5 * (n - 6))
     return (PORT_GOLD_REGEN_PER_PORT * percent) // 100
 
 
@@ -893,8 +897,12 @@ def make_hub_embed(member, player):
     ports = player.get("ports", 0)
     if ports > 0:
         n = active_alliance_count(player)
-        percent = 100 + (PORT_ALLIANCE_BONUS_PERCENT * n)
-        per_port = port_earnings_per_port(player)
+        if n <= 2:
+            percent = 100 + (20 * n)
+        elif n <= 6:
+            percent = 140 + (15 * (n - 2))
+        else:
+            percent = 200 + (5 * (n - 6))
         ports_value = f"{ports} ({percent}%)"
     else:
         ports_value = "0"
