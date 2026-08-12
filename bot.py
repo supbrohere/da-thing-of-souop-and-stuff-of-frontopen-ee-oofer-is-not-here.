@@ -11,6 +11,10 @@ from dotenv import load_dotenv
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
+DEV_IDS = [
+    1091868001109803080, 1271780747945967649
+]
+
 STARTING_TROOPS = 500
 STARTING_TROOP_CAP = 5000
 TROOP_REGEN_FLOOR = 1.1
@@ -28,7 +32,9 @@ SILO_PRICES = [9000, 15000, 20000, 25000, 35000, 50000, 50000, 50000, 100000]
 MISSILE_TYPES = {
     "atom_bomb": {"label": "Atom Bomb", "emoji": "☢️", "price": 15000, "structure_destroy_percent": 0.50, "troop_destroy_percent": 0.0},
     "hydro_bomb": {"label": "Hydrogen Bomb", "emoji": "💥", "price": 45000, "structure_destroy_percent": 0.75, "troop_destroy_percent": 0.50},
+    "mirv": {"label": "MIRV", "emoji": "☄️", "price": 99999, "structure_destroy_percent": 0.45, "troop_destroy_percent": 0.20},
 }
+MIRV_INTERCEPTS_NEEDED = 3
 TICK_MINUTES = 5
 TICK_SECONDS = TICK_MINUTES * 60
 
@@ -59,13 +65,16 @@ SPAWN_IMMUNITY_SECONDS = 6 * 3600
 ATTACK_BUFF_DAMAGE_MULTIPLIER = 1.5
 ATTACK_BUFF_DURATION_SECONDS = 6 * 3600
 SILO_COOLDOWN_SECONDS = 2 * 3600
-SAM_PRICES = [20000, 45000, 80000, 130000, 190000]
-SAM_MAX_LEVEL = 5
+SAM_PRICES = [20000, 45000, 80000, 130000, 190000, 260000]
+SAM_MAX_LEVEL = 6
 SAM_INTERCEPTOR_PRICE = 20000
 SAM_COOLDOWN_SECONDS = 2 * 3600
 STREAK_DAY_BOUNDARY_UTC_SECONDS = 22 * 3600
 STREAK_BONUS_GOLD = 35000
 RESPAWN_COOLDOWN_SECONDS = 2 * 3600
+TROOP_JAR_CAP = 3000000
+CLAN_GAMES_REWARD_GOLD_PER_MEMBER = 100000
+CLAN_GAMES_TOP_CONTRIBUTOR_BONUS_GOLD = 50000
 DATA_FILE = "game_data.json"
 
 intents = discord.Intents.default()
@@ -336,6 +345,55 @@ def make_clan_war_embed(tag, clan):
     return embed
 
 
+def make_clan_games_embed(tag, clan):
+    jar = clan.get("troop_jar", 0)
+    winner = data.get("clan_games_winner")
+    embed = discord.Embed(title=f"🏺 [{tag}] Clan Games — Troop Jar", color=discord.Color.blue())
+    if winner:
+        if winner == tag:
+            embed.description = f"[{tag}] already won the Clan Games! Rewards have been paid out."
+        else:
+            embed.description = f"The Clan Games have already been won by [{winner}]. No more rewards are available."
+    else:
+        embed.description = (
+            f"Be the first clan to fill the jar to {TROOP_JAR_CAP:,} troops (global, shared across every server) "
+            f"and every member gets {CLAN_GAMES_REWARD_GOLD_PER_MEMBER:,} gold, plus a "
+            f"{CLAN_GAMES_TOP_CONTRIBUTOR_BONUS_GOLD:,} gold bonus for whoever deposited the most."
+        )
+    embed.add_field(name="Jar Progress", value=f"{jar:,} / {TROOP_JAR_CAP:,} troops", inline=False)
+    contributions = clan.get("troop_jar_contributions", {})
+    if contributions:
+        top_uid = max(contributions, key=contributions.get)
+        embed.add_field(name="Top Contributor", value=f"<@{top_uid}> — {contributions[top_uid]:,} troops", inline=False)
+    return embed
+
+
+def complete_clan_games(tag):
+    clan = get_clan(tag)
+    if clan is None:
+        return
+    contributions = clan.get("troop_jar_contributions", {})
+    top_uid = max(contributions, key=contributions.get) if contributions else None
+    for guild_dict in data.get("guilds", {}).values():
+        for uid in clan.get("members", []):
+            p = guild_dict.get("players", {}).get(str(uid))
+            if is_active_player(p):
+                p["gold"] = p.get("gold", 0) + CLAN_GAMES_REWARD_GOLD_PER_MEMBER
+                if top_uid is not None and uid == top_uid:
+                    p["gold"] += CLAN_GAMES_TOP_CONTRIBUTOR_BONUS_GOLD
+    save_data(data)
+
+
+async def notify_dev_clan_games(tag):
+    if not DEV_IDS:
+        return
+    try:
+        user = await bot.fetch_user(DEV_IDS[0])
+        await user.send(f"🏆 [{tag}] just completed the Clan Games, filling their troop jar to {TROOP_JAR_CAP:,} troops!")
+    except (discord.Forbidden, discord.HTTPException, discord.NotFound):
+        pass
+
+
 def create_player(guild_id, user_id):
     players = get_guild_players(guild_id)
     uid = str(user_id)
@@ -544,6 +602,10 @@ def has_admin_access(interaction: discord.Interaction):
     return interaction.permissions.manage_guild
 
 
+def is_dev(interaction: discord.Interaction):
+    return interaction.user.id in DEV_IDS
+
+
 def is_attack_buffed(player, now=None):
     if now is None:
         now = time.time()
@@ -576,6 +638,21 @@ def try_intercept(defender, stack_idx):
         box["sam_cooldown_until"] = time.time() + SAM_COOLDOWN_SECONDS
         box["sam_shots_fired"] = 0
     return True
+
+
+def resolve_mirv_intercept(defender, stack_idx):
+    box = defender["grid"][stack_idx]
+    shots_used = 0
+    for _ in range(MIRV_INTERCEPTS_NEEDED):
+        if not can_sam_intercept(box):
+            break
+        box["sam_stock"] -= 1
+        box["sam_shots_fired"] = box.get("sam_shots_fired", 0) + 1
+        shots_used += 1
+        if box["sam_shots_fired"] >= box.get("sam_level", 0) or box["sam_stock"] <= 0:
+            box["sam_cooldown_until"] = time.time() + SAM_COOLDOWN_SECONDS
+            box["sam_shots_fired"] = 0
+    return shots_used >= MIRV_INTERCEPTS_NEEDED
 
 
 def format_remaining(seconds):
@@ -2083,6 +2160,10 @@ class LaunchTargetSelectView(discord.ui.View):
             return
 
         ensure_grid(defender)
+        if self.missile_key == "mirv":
+            await resolve_mirv_launch(interaction, self.guild_id, interaction.user, target, self.silo_index)
+            return
+
         view = LaunchStackPickView(self.guild_id, interaction.user, target, self.silo_index, self.missile_key)
         await interaction.response.edit_message(
             content=f"Which of {target.display_name}'s stacks are you targeting?",
@@ -2118,6 +2199,10 @@ class LaunchBetrayConfirmView(discord.ui.View):
         save_data(data)
 
         ensure_grid(defender)
+        if self.missile_key == "mirv":
+            await resolve_mirv_launch(interaction, self.guild_id, self.attacker_member, self.defender_member, self.silo_index)
+            return
+
         view = LaunchStackPickView(self.guild_id, self.attacker_member, self.defender_member, self.silo_index, self.missile_key)
         await interaction.response.edit_message(
             content=(
@@ -2308,6 +2393,149 @@ class LaunchStackPickView(discord.ui.View):
 
     async def cancel(self, interaction: discord.Interaction):
         await interaction.response.edit_message(content="Launch cancelled.", view=None)
+
+
+async def resolve_mirv_launch(interaction, guild_id, attacker_member, defender_member, silo_index):
+    attacker = get_player(guild_id, attacker_member.id)
+    defender = get_player(guild_id, defender_member.id)
+    if not is_active_player(attacker):
+        await interaction.response.edit_message(content="You can't do that rn.", view=None)
+        return
+    if not is_active_player(defender):
+        await interaction.response.edit_message(content="That player is no longer a valid target.", view=None)
+        return
+    ensure_grid(attacker)
+    ensure_grid(defender)
+
+    if silo_index >= len(attacker["grid"]) or attacker["grid"][silo_index].get("silo", 0) <= 0:
+        await interaction.response.edit_message(content="That silo isn't there anymore.", view=None)
+        return
+    if attacker["grid"][silo_index].get("missile") != "mirv":
+        await interaction.response.edit_message(content="That missile isn't loaded anymore.", view=None)
+        return
+    if is_silo_on_cooldown(attacker["grid"][silo_index]):
+        remaining = format_remaining(attacker["grid"][silo_index]["cooldown_until"] - time.time())
+        await interaction.response.edit_message(content=f"That silo is on cooldown for {remaining}. Use a different one.", view=None)
+        return
+
+    attacker["grid"][silo_index]["missile"] = None
+    attacker["grid"][silo_index]["cooldown_until"] = time.time() + SILO_COOLDOWN_SECONDS
+    attacker["immune_until"] = 0
+
+    stack_count = len(defender["grid"])
+    total_cities = total_ports = total_silos = total_troops = 0
+    landed_hits = 0
+    for idx in range(stack_count):
+        intercepted = resolve_mirv_intercept(defender, idx)
+        if intercepted:
+            continue
+        cities_d, ports_d, silos_d, troops_d = resolve_missile_strike(defender, idx, "mirv")
+        total_cities += cities_d
+        total_ports += ports_d
+        total_silos += silos_d
+        total_troops += troops_d
+        landed_hits += 1
+
+    intercepted_count = stack_count - landed_hits
+
+    eliminated = False
+    gold_captured = 0
+    if defender["troops"] <= 0 and defender["cities"] <= 0 and defender["ports"] <= 0:
+        eliminated = True
+        defender["eliminated"] = True
+        defender["eliminated_at"] = time.time()
+        defender["alliances"] = {}
+        gold_captured = defender["gold"]
+        attacker["gold"] += gold_captured
+        defender["gold"] = 0
+
+    war_result = None
+    if landed_hits > 0:
+        war_result = award_war_points(
+            attacker_member.id, defender_member.id,
+            CLAN_WAR_POINTS_PER_MISSILE_HIT * landed_hits, eliminated
+        )
+
+    save_data(data)
+
+    missile_label = MISSILE_TYPES["mirv"]["label"]
+    missile_emoji = MISSILE_TYPES["mirv"]["emoji"]
+    guild_obj = bot.get_guild(int(guild_id))
+    guild_name = guild_obj.name if guild_obj else "Unknown Server"
+
+    dm_sent = True
+    try:
+        if landed_hits == 0:
+            dm_embed = discord.Embed(
+                title="🛡 MIRV Fully Intercepted!",
+                description=f"**{attacker_member.display_name}** launched a MIRV at you, but every stack's SAM shot it down!",
+                color=discord.Color.green()
+            )
+            dm_embed.add_field(name="📍 Server", value=guild_name, inline=False)
+        else:
+            dm_embed = discord.Embed(
+                title=f"{missile_emoji} You've Been MIRV'd!",
+                description=f"**{attacker_member.display_name}** launched a MIRV, hitting all of your stacks at once.",
+                color=discord.Color.dark_red()
+            )
+            dm_embed.add_field(name="🎯 Stacks Hit", value=f"{landed_hits}/{stack_count} (intercepted: {intercepted_count})", inline=True)
+            dm_embed.add_field(name="🏙 Structures Lost", value=f"{total_cities} cities, {total_ports} ports, {total_silos} silos", inline=True)
+            if total_troops > 0:
+                dm_embed.add_field(name="💀 Troops Lost", value=f"{total_troops:,}", inline=True)
+            if eliminated:
+                dm_embed.add_field(name="💀 Status", value="You have been eliminated and can no longer rejoin.", inline=False)
+                if gold_captured > 0:
+                    dm_embed.add_field(name="💰 Gold Looted", value=f"{gold_captured:,}", inline=True)
+            dm_embed.add_field(name="📍 Server", value=guild_name, inline=False)
+            dm_embed.set_footer(text="do /attack or build another silo to retaliate")
+        await defender_member.send(embed=dm_embed)
+    except (discord.Forbidden, discord.HTTPException):
+        dm_sent = False
+
+    result_lines = [
+        f"You launched a {missile_label} from Stack {silo_index + 1} at {defender_member.display_name}, hitting all {stack_count} of their stacks.",
+        f"{landed_hits} landed, {intercepted_count} intercepted."
+    ]
+    if landed_hits > 0:
+        result_lines.append(
+            f"Destroyed {total_cities + total_ports + total_silos} structure(s) total "
+            f"({total_cities} cities, {total_ports} ports, {total_silos} silos)."
+        )
+        if total_troops > 0:
+            result_lines.append(f"Also wiped out {total_troops:,} of their troops.")
+    if not dm_sent:
+        result_lines.append("⚠️ Couldn't DM them (their settings are blocking it) they won't know unless you tell them.")
+    if eliminated:
+        result_lines.append(f"{defender_member.display_name} has been eliminated!")
+        if gold_captured > 0:
+            result_lines.append(f"You looted {gold_captured:,} gold from their fallen nation!")
+    if war_result:
+        result_lines.append(
+            f"⚔️ +{war_result['gained']} war points for [{war_result['clan']}] vs [{war_result['enemy']}] "
+            f"(now {war_result['total']}/{CLAN_WAR_POINTS_TO_WIN})."
+        )
+        if war_result["won"]:
+            result_lines.append(
+                f"🏆 [{war_result['clan']}] hit the war goal and defeated [{war_result['enemy']}]! "
+                f"Every member got {CLAN_WAR_REWARD_GOLD:,} gold."
+            )
+
+    log_embed = discord.Embed(
+        title=f"{missile_emoji} MIRV Launch",
+        color=discord.Color.green() if landed_hits == 0 else discord.Color.dark_red()
+    )
+    log_embed.add_field(name="Launcher", value=attacker_member.mention, inline=True)
+    log_embed.add_field(name="Target", value=defender_member.mention, inline=True)
+    log_embed.add_field(name="Stacks Hit", value=f"{landed_hits}/{stack_count}", inline=True)
+    if landed_hits > 0:
+        log_embed.add_field(name="Structures Destroyed", value=f"{total_cities} cities, {total_ports} ports, {total_silos} silos", inline=True)
+        if total_troops > 0:
+            log_embed.add_field(name="Troops Destroyed", value=f"{total_troops:,}", inline=True)
+    if eliminated:
+        log_embed.add_field(name="💀 Eliminated", value=f"{defender_member.mention} (looted {gold_captured:,} gold)", inline=False)
+    await send_action_log(guild_id, log_embed)
+
+    await interaction.response.edit_message(content="\n".join(result_lines), view=None)
 
 
 @bot.tree.command(name="gamehub", description="Manage your lands, or optionally view another player's stuff")
@@ -2769,41 +2997,156 @@ async def attack(interaction: discord.Interaction, target: discord.Member):
     view = AttackView(interaction.guild_id, interaction.user, target, attacker["troops"])
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
-@bot.tree.command(name="admingive", description="(Admins) Give or take troops/gold from a player")
-@discord.app_commands.describe(target="Who to give to", resource="Troops or gold", amount="Amount (use a negative number to take away)")
-@discord.app_commands.choices(resource=[
-    discord.app_commands.Choice(name="Troops", value="troops"),
-    discord.app_commands.Choice(name="Gold", value="gold"),
-])
-async def admingive(interaction: discord.Interaction, target: discord.Member, resource: discord.app_commands.Choice[str], amount: int):
-    if not has_admin_access(interaction):
-        await interaction.response.send_message("❌ You need Manage Server permission to use this.", ephemeral=True)
-        return
+class ChannelLogSelectView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
 
-    player = get_player(interaction.guild_id, target.id)
-    if not is_active_player(player):
-        await interaction.response.send_message(f"{target.display_name} isn't an active player.", ephemeral=True)
-        return
+    @discord.ui.select(cls=discord.ui.ChannelSelect, channel_types=[discord.ChannelType.text], placeholder="Pick a channel for action logs", min_values=1, max_values=1)
+    async def pick_channel(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+        if not has_admin_access(interaction):
+            await interaction.response.send_message("❌ You need Manage Server permission to use this.", ephemeral=True)
+            return
 
-    if resource.value == "troops":
-        player["troops"] = max(0, min(player["troops"] + amount, player["troop_cap"]))
+        channel = select.values[0]
+        guild_dict = get_guild_dict(interaction.guild_id)
+        guild_dict["log_channel_id"] = channel.id
         save_data(data)
-        await interaction.response.send_message(f"✅ {target.mention}'s troops are now {player['troops']:,} / {player['troop_cap']:,}.")
-    else:
-        player["gold"] = max(0, player["gold"] + amount)
-        save_data(data)
-        await interaction.response.send_message(f"✅ {target.mention}'s gold is now {player['gold']:,}.")
 
-class RestartConfirmView(discord.ui.View):
+        await interaction.response.edit_message(content=f"✅ Action logs will now be posted in {channel.mention}.", view=None)
+
+
+class BotStatusSelectView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
+
+    @discord.ui.select(cls=discord.ui.ChannelSelect, channel_types=[discord.ChannelType.text], placeholder="Pick a channel for the bot status", min_values=1, max_values=1)
+    async def pick_channel(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+        if not has_admin_access(interaction):
+            await interaction.response.send_message("❌ You need Manage Server permission to use this.", ephemeral=True)
+            return
+
+        channel = select.values[0]
+        message = await channel.send(embed=make_status_embed(True))
+
+        guild_dict = get_guild_dict(interaction.guild_id)
+        guild_dict["status_channel_id"] = channel.id
+        guild_dict["status_message_id"] = message.id
+        save_data(data)
+
+        await interaction.response.edit_message(content=f"✅ Status will now show in {channel.mention} and update itself on startup/shutdown.", view=None)
+
+
+class AdminPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
+
+    @discord.ui.button(label="Channel Log", style=discord.ButtonStyle.danger)
+    async def channel_log(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not has_admin_access(interaction):
+            await interaction.response.send_message("❌ You need Manage Server permission to use this.", ephemeral=True)
+            return
+        await interaction.response.edit_message(content="Pick a channel for action logs:", view=ChannelLogSelectView())
+
+    @discord.ui.button(label="Bot Status", style=discord.ButtonStyle.danger)
+    async def bot_status(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not has_admin_access(interaction):
+            await interaction.response.send_message("❌ You need Manage Server permission to use this.", ephemeral=True)
+            return
+        await interaction.response.edit_message(content="Pick a channel for the bot status message:", view=BotStatusSelectView())
+
+
+class DevGiveAmountModal(discord.ui.Modal, title="Amount"):
+    amount = discord.ui.TextInput(label="Amount (negative to take away)", placeholder="e.g. 1000 or -500")
+
+    def __init__(self, guild_id, target, resource):
+        super().__init__()
+        self.guild_id = guild_id
+        self.target = target
+        self.resource = resource
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_dev(interaction):
+            await interaction.response.send_message("❌ You don't have access to this.", ephemeral=True)
+            return
+
+        try:
+            amount = int(self.amount.value.strip())
+        except ValueError:
+            await interaction.response.send_message("Enter a whole number.", ephemeral=True)
+            return
+
+        player = get_player(self.guild_id, self.target.id)
+        if not is_active_player(player):
+            await interaction.response.send_message(f"{self.target.display_name} isn't an active player.", ephemeral=True)
+            return
+
+        if self.resource == "troops":
+            player["troops"] = max(0, min(player["troops"] + amount, player["troop_cap"]))
+            save_data(data)
+            await interaction.response.send_message(f"✅ {self.target.mention}'s troops are now {player['troops']:,} / {player['troop_cap']:,}.", ephemeral=True)
+        else:
+            player["gold"] = max(0, player["gold"] + amount)
+            save_data(data)
+            await interaction.response.send_message(f"✅ {self.target.mention}'s gold is now {player['gold']:,}.", ephemeral=True)
+
+
+class DevGiveResourceView(discord.ui.View):
+    def __init__(self, guild_id, target):
+        super().__init__(timeout=60)
+        self.guild_id = guild_id
+        self.target = target
+
+    @discord.ui.button(label="Troops", style=discord.ButtonStyle.success)
+    async def troops(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_dev(interaction):
+            await interaction.response.send_message("❌ You don't have access to this.", ephemeral=True)
+            return
+        await interaction.response.send_modal(DevGiveAmountModal(self.guild_id, self.target, "troops"))
+
+    @discord.ui.button(label="Gold", style=discord.ButtonStyle.success)
+    async def gold(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_dev(interaction):
+            await interaction.response.send_message("❌ You don't have access to this.", ephemeral=True)
+            return
+        await interaction.response.send_modal(DevGiveAmountModal(self.guild_id, self.target, "gold"))
+
+
+class DevGiveTargetSelectView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
+
+    @discord.ui.select(cls=discord.ui.UserSelect, placeholder="Choose who to give to", min_values=1, max_values=1)
+    async def pick_target(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
+        if not is_dev(interaction):
+            await interaction.response.send_message("❌ You don't have access to this.", ephemeral=True)
+            return
+        target = select.values[0]
+        await interaction.response.edit_message(content=f"Give troops or gold to {target.display_name}?", view=DevGiveResourceView(interaction.guild_id, target))
+
+
+class DevRestartConfirmView(discord.ui.View):
     def __init__(self, guild_id):
         super().__init__(timeout=30)
         self.guild_id = guild_id
 
-    @discord.ui.button(label="Yes, wipe everyone", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="Yes, wipe everyone", style=discord.ButtonStyle.success)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_dev(interaction):
+            await interaction.response.send_message("❌ You don't have access to this.", ephemeral=True)
+            return
+
         gid = str(self.guild_id)
-        data["guilds"][gid] = {"players": {}}
+        old_guild_dict = data["guilds"].get(gid, {})
+        new_guild_dict = {"players": {}}
+        if old_guild_dict.get("log_channel_id"):
+            new_guild_dict["log_channel_id"] = old_guild_dict["log_channel_id"]
+        if old_guild_dict.get("status_channel_id"):
+            new_guild_dict["status_channel_id"] = old_guild_dict["status_channel_id"]
+        if old_guild_dict.get("status_message_id"):
+            new_guild_dict["status_message_id"] = old_guild_dict["status_message_id"]
+        data["guilds"][gid] = new_guild_dict
         save_data(data)
+
         await interaction.response.edit_message(
             content="✅ The game has been reset for this server. Everyone needs to use /joingame again.",
             view=None
@@ -2813,50 +3156,98 @@ class RestartConfirmView(discord.ui.View):
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(content="Cancelled, nothing was reset.", view=None)
 
-@bot.tree.command(name="adminrestart", description="(Admins) Wipe everyone and restart the game")
-async def adminrestart(interaction: discord.Interaction):
-    if not has_admin_access(interaction):
-        await interaction.response.send_message("❌ You need Manage Server permission to use this.", ephemeral=True)
-        return
 
-    view = RestartConfirmView(interaction.guild_id)
-    await interaction.response.send_message(
-        "⚠️ This will wipe **everyone's** troops, gold, cities, and alliances in this server. "
-        "Are you sure?",
-        view=view,
-        ephemeral=True
-    )
+class DevRespawnTargetSelectView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
+
+    @discord.ui.select(cls=discord.ui.UserSelect, placeholder="Choose who to revive", min_values=1, max_values=1)
+    async def pick_target(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
+        if not is_dev(interaction):
+            await interaction.response.send_message("❌ You don't have access to this.", ephemeral=True)
+            return
+
+        target = select.values[0]
+        player = get_player(interaction.guild_id, target.id)
+        if player is None:
+            await interaction.response.edit_message(content=f"{target.display_name} hasn't joined the game.", view=None)
+            return
+
+        player["troops"] = STARTING_TROOPS
+        player["troop_cap"] = STARTING_TROOP_CAP
+        player["gold"] = 0
+        player["cities"] = 0
+        player["ports"] = 0
+        player["silos"] = 0
+        player["grid"] = [{"cities": 0, "ports": 0, "silo": 0, "missile": None, "cooldown_until": 0, "sam_level": 0, "sam_stock": 0, "sam_cooldown_until": 0, "sam_shots_fired": 0} for _ in range(STARTING_STACK_COUNT)]
+        player["eliminated"] = False
+        player["immune_until"] = time.time() + SPAWN_IMMUNITY_SECONDS
+        save_data(data)
+
+        await interaction.response.edit_message(
+            content=f"✅ {target.mention} was instantly revived with a fresh start ({STARTING_TROOPS} troops, cap {STARTING_TROOP_CAP}, 0 gold, 0 cities).",
+            view=None
+        )
 
 
-@bot.tree.command(name="botstatus", description="(Admins) Set a channel to show a live bot online/offline status")
-@discord.app_commands.describe(channel="Which channel should show the bot's status?")
-async def botstatus(interaction: discord.Interaction, channel: discord.TextChannel):
-    if not has_admin_access(interaction):
-        await interaction.response.send_message("❌ You need Manage Server permission to use this.", ephemeral=True)
-        return
+class DevPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
 
-    message = await channel.send(embed=make_status_embed(True))
+    @discord.ui.button(label="Dev Give", style=discord.ButtonStyle.success)
+    async def dev_give(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_dev(interaction):
+            await interaction.response.send_message("❌ You don't have access to this.", ephemeral=True)
+            return
+        await interaction.response.edit_message(content="Who do you want to give to?", view=DevGiveTargetSelectView())
 
-    guild_dict = get_guild_dict(interaction.guild_id)
-    guild_dict["status_channel_id"] = channel.id
-    guild_dict["status_message_id"] = message.id
-    save_data(data)
+    @discord.ui.button(label="Dev Restart", style=discord.ButtonStyle.success)
+    async def dev_restart(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_dev(interaction):
+            await interaction.response.send_message("❌ You don't have access to this.", ephemeral=True)
+            return
+        view = DevRestartConfirmView(interaction.guild_id)
+        await interaction.response.edit_message(
+            content="⚠️ This will wipe **everyone's** troops, gold, cities, and alliances in this server (channel log and bot status settings are kept). Are you sure?",
+            view=view
+        )
 
-    await interaction.response.send_message(f"✅ Status will now show in {channel.mention} and update itself on startup/shutdown.", ephemeral=True)
+    @discord.ui.button(label="Instant Respawn", style=discord.ButtonStyle.success)
+    async def instant_respawn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_dev(interaction):
+            await interaction.response.send_message("❌ You don't have access to this.", ephemeral=True)
+            return
+        await interaction.response.edit_message(content="Who do you want to revive?", view=DevRespawnTargetSelectView())
 
 
-@bot.tree.command(name="channellog", description="(Admins) Set a channel for action logs (attacks, missiles, eliminations, alliances)")
-@discord.app_commands.describe(channel="Which channel should receive the logs?")
-async def channellog(interaction: discord.Interaction, channel: discord.TextChannel):
-    if not has_admin_access(interaction):
-        await interaction.response.send_message("❌ You need Manage Server permission to use this.", ephemeral=True)
-        return
+class PanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
 
-    guild_dict = get_guild_dict(interaction.guild_id)
-    guild_dict["log_channel_id"] = channel.id
-    save_data(data)
+    @discord.ui.button(label="Admin Panel", style=discord.ButtonStyle.danger)
+    async def admin_panel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not has_admin_access(interaction):
+            await interaction.response.send_message("❌ You need Manage Server permission to use this.", ephemeral=True)
+            return
+        await interaction.response.edit_message(content="Admin Panel", view=AdminPanelView())
 
-    await interaction.response.send_message(f"✅ Action logs will now be posted in {channel.mention}.", ephemeral=True)
+    @discord.ui.button(label="Dev Panel", style=discord.ButtonStyle.success)
+    async def dev_panel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_dev(interaction):
+            await interaction.response.send_message("❌ You don't have access to the dev panel.", ephemeral=True)
+            return
+        await interaction.response.edit_message(content="Dev Panel", view=DevPanelView())
+
+
+@bot.tree.command(name="panel", description="Open the admin/dev control panel")
+async def panel(interaction: discord.Interaction):
+    await interaction.response.send_message("Choose a panel:", view=PanelView(), ephemeral=True)
+
+
+@bot.tree.command(name="ping", description="Check the bot's latency")
+async def ping(interaction: discord.Interaction):
+    latency_ms = round(bot.latency * 1000)
+    await interaction.response.send_message(f"🏓 Pong! Latency: {latency_ms}ms", ephemeral=True)
 
 
 class ClanVisibilityView(discord.ui.View):
@@ -3297,6 +3688,108 @@ class ClanWithdrawModal(discord.ui.Modal, title="Withdraw Troops"):
         await interaction.response.edit_message(embed=embed, view=view)
 
 
+class TroopJarDepositModal(discord.ui.Modal, title="Deposit to Troop Jar"):
+    amount_input = discord.ui.TextInput(label="Amount to deposit", placeholder="e.g. 500")
+
+    def __init__(self, guild_id, user_id, tag):
+        super().__init__()
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.tag = tag
+
+    async def on_submit(self, interaction: discord.Interaction):
+        amount = await parse_amount(interaction, self.amount_input.value.strip())
+        if amount is None:
+            return
+
+        clan = get_clan(self.tag)
+        if not in_clan(clan, self.user_id):
+            await interaction.response.send_message("You're not in that clan anymore.", ephemeral=True)
+            return
+
+        if data.get("clan_games_winner"):
+            await interaction.response.send_message(
+                f"The Clan Games have already been won by [{data['clan_games_winner']}].", ephemeral=True
+            )
+            return
+
+        player = get_player(self.guild_id, self.user_id)
+        if not is_active_player(player):
+            await interaction.response.send_message(
+                "You need to be an active player in this server to deposit troops here.", ephemeral=True
+            )
+            return
+
+        if player["troops"] < amount:
+            await interaction.response.send_message(f"You only have {player['troops']:,} troops.", ephemeral=True)
+            return
+
+        current_jar = clan.get("troop_jar", 0)
+        room = TROOP_JAR_CAP - current_jar
+        if amount > room:
+            await interaction.response.send_message(
+                f"The jar only has room for {room:,} more troops (cap {TROOP_JAR_CAP:,}).", ephemeral=True
+            )
+            return
+
+        player["troops"] -= amount
+        clan["troop_jar"] = current_jar + amount
+        contributions = clan.setdefault("troop_jar_contributions", {})
+        contributions[str(self.user_id)] = contributions.get(str(self.user_id), 0) + amount
+        save_data(data)
+
+        just_won = False
+        if clan["troop_jar"] >= TROOP_JAR_CAP and not data.get("clan_games_winner"):
+            data["clan_games_winner"] = self.tag
+            save_data(data)
+            complete_clan_games(self.tag)
+            just_won = True
+
+        embed = make_clan_games_embed(self.tag, clan)
+        view = ClanGamesView(self.guild_id, self.user_id, self.tag)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+        if just_won:
+            await notify_dev_clan_games(self.tag)
+
+
+class ClanGamesView(discord.ui.View):
+    def __init__(self, guild_id, user_id, tag):
+        super().__init__(timeout=120)
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.tag = tag
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your clan hub lil bro.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Deposit Troops", style=discord.ButtonStyle.success, emoji="🏺")
+    async def deposit_clicked(self, interaction: discord.Interaction, button: discord.ui.Button):
+        clan = get_clan(self.tag)
+        if not in_clan(clan, self.user_id):
+            await interaction.response.edit_message(content="You're not in that clan anymore.", embed=None, view=None)
+            return
+        if data.get("clan_games_winner"):
+            await interaction.response.send_message(
+                f"The Clan Games have already been won by [{data['clan_games_winner']}].", ephemeral=True
+            )
+            return
+        await interaction.response.send_modal(TroopJarDepositModal(self.guild_id, self.user_id, self.tag))
+
+    @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary)
+    async def back_clicked(self, interaction: discord.Interaction, button: discord.ui.Button):
+        clan = get_clan(self.tag)
+        if not in_clan(clan, self.user_id):
+            await interaction.response.edit_message(content="You're not in that clan anymore.", embed=None, view=None)
+            return
+        embed, page, total_pages = make_clan_hub_embed(self.guild_id, self.tag, clan)
+        view = ClanHubView(self.guild_id, self.user_id, self.tag, page)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+
 class ClanLeaveConfirmView(discord.ui.View):
     def __init__(self, guild_id, user_id, tag, page=0):
         super().__init__(timeout=60)
@@ -3545,6 +4038,15 @@ class ClanHubView(discord.ui.View):
             return
         embed = make_clan_war_embed(self.tag, clan)
         view = ClanWarView(self.guild_id, self.user_id, self.tag)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    @discord.ui.button(label="Clan Games", style=discord.ButtonStyle.primary, emoji="🏺", row=0)
+    async def clan_games_clicked(self, interaction: discord.Interaction, button: discord.ui.Button):
+        clan = await self.member_clan(interaction)
+        if clan is None:
+            return
+        embed = make_clan_games_embed(self.tag, clan)
+        view = ClanGamesView(self.guild_id, self.user_id, self.tag)
         await interaction.response.edit_message(embed=embed, view=view)
 
     @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary, row=1)
