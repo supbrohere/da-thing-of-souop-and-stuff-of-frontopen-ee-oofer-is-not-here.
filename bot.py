@@ -32,7 +32,7 @@ SILO_PRICES = [9000, 15000, 20000, 25000, 35000, 50000, 50000, 50000, 100000]
 MISSILE_TYPES = {
     "atom_bomb": {"label": "Atom Bomb", "emoji": "☢️", "price": 15000, "structure_destroy_percent": 0.50, "troop_destroy_percent": 0.0},
     "hydro_bomb": {"label": "Hydrogen Bomb", "emoji": "💥", "price": 45000, "structure_destroy_percent": 0.75, "troop_destroy_percent": 0.50},
-    "mirv": {"label": "MIRV", "emoji": "☄️", "price": 99999, "structure_destroy_percent": 0.45, "troop_destroy_percent": 0.20},
+    "mirv": {"label": "MIRV", "emoji": "☄️", "price": 4999999, "structure_destroy_percent": 0.40, "troop_destroy_percent": 0.20},
 }
 MIRV_INTERCEPTS_NEEDED = 3
 TICK_MINUTES = 5
@@ -55,12 +55,12 @@ CLAN_TAG_MAX_LEN = 10
 CLAN_DESC_MAX_LEN = 200
 CLANS_PER_PAGE = 10
 CLAN_MEMBERS_PER_PAGE = 10
-CLAN_BANK_CAP = 30000
+CLAN_BANK_CAP = 40000
 CLAN_WAR_POINTS_TO_WIN = 100
 CLAN_WAR_POINTS_PER_ATTACK = 5
 CLAN_WAR_POINTS_PER_MISSILE_HIT = 10
 CLAN_WAR_POINTS_PER_ELIMINATION = 25
-CLAN_WAR_REWARD_GOLD = 50000
+CLAN_WAR_REWARD_GOLD = 70000
 SPAWN_IMMUNITY_SECONDS = 6 * 3600
 ATTACK_BUFF_DAMAGE_MULTIPLIER = 1.5
 ATTACK_BUFF_DURATION_SECONDS = 6 * 3600
@@ -72,9 +72,7 @@ SAM_COOLDOWN_SECONDS = 2 * 3600
 STREAK_DAY_BOUNDARY_UTC_SECONDS = 22 * 3600
 STREAK_BONUS_GOLD = 35000
 RESPAWN_COOLDOWN_SECONDS = 2 * 3600
-TROOP_JAR_CAP = 3000000
-CLAN_GAMES_REWARD_GOLD_PER_MEMBER = 100000
-CLAN_GAMES_TOP_CONTRIBUTOR_BONUS_GOLD = 50000
+CLAN_MAX_MEMBERS = 10
 DATA_FILE = "game_data.json"
 
 intents = discord.Intents.default()
@@ -343,55 +341,6 @@ def make_clan_war_embed(tag, clan):
             )
         embed.description = "\n".join(lines)
     return embed
-
-
-def make_clan_games_embed(tag, clan):
-    jar = clan.get("troop_jar", 0)
-    winner = data.get("clan_games_winner")
-    embed = discord.Embed(title=f"🏺 [{tag}] Clan Games — Troop Jar", color=discord.Color.blue())
-    if winner:
-        if winner == tag:
-            embed.description = f"[{tag}] already won the Clan Games! Rewards have been paid out."
-        else:
-            embed.description = f"The Clan Games have already been won by [{winner}]. No more rewards are available."
-    else:
-        embed.description = (
-            f"Be the first clan to fill the jar to {TROOP_JAR_CAP:,} troops (global, shared across every server) "
-            f"and every member gets {CLAN_GAMES_REWARD_GOLD_PER_MEMBER:,} gold, plus a "
-            f"{CLAN_GAMES_TOP_CONTRIBUTOR_BONUS_GOLD:,} gold bonus for whoever deposited the most."
-        )
-    embed.add_field(name="Jar Progress", value=f"{jar:,} / {TROOP_JAR_CAP:,} troops", inline=False)
-    contributions = clan.get("troop_jar_contributions", {})
-    if contributions:
-        top_uid = max(contributions, key=contributions.get)
-        embed.add_field(name="Top Contributor", value=f"<@{top_uid}> — {contributions[top_uid]:,} troops", inline=False)
-    return embed
-
-
-def complete_clan_games(tag):
-    clan = get_clan(tag)
-    if clan is None:
-        return
-    contributions = clan.get("troop_jar_contributions", {})
-    top_uid = max(contributions, key=contributions.get) if contributions else None
-    for guild_dict in data.get("guilds", {}).values():
-        for uid in clan.get("members", []):
-            p = guild_dict.get("players", {}).get(str(uid))
-            if is_active_player(p):
-                p["gold"] = p.get("gold", 0) + CLAN_GAMES_REWARD_GOLD_PER_MEMBER
-                if top_uid is not None and uid == top_uid:
-                    p["gold"] += CLAN_GAMES_TOP_CONTRIBUTOR_BONUS_GOLD
-    save_data(data)
-
-
-async def notify_dev_clan_games(tag):
-    if not DEV_IDS:
-        return
-    try:
-        user = await bot.fetch_user(DEV_IDS[0])
-        await user.send(f"🏆 [{tag}] just completed the Clan Games, filling their troop jar to {TROOP_JAR_CAP:,} troops!")
-    except (discord.Forbidden, discord.HTTPException, discord.NotFound):
-        pass
 
 
 def create_player(guild_id, user_id):
@@ -859,7 +808,7 @@ async def joingame(interaction: discord.Interaction):
         f"{STARTING_TROOPS} troops (cap {STARTING_TROOP_CAP}) and 0 gold."
     )
 
-@bot.tree.command(name="respawn", description="Rejoin the game after being eliminated (3 hour cooldown)")
+@bot.tree.command(name="respawn", description="Rejoin the game after being eliminated (2 hour cooldown)")
 async def respawn(interaction: discord.Interaction):
     player = get_player(interaction.guild_id, interaction.user.id)
     if player is None or not player.get("eliminated"):
@@ -949,7 +898,7 @@ async def help_command(interaction: discord.Interaction):
         name="Commands",
         value=(
             "`/joingame` - Join the game\n"
-            "`/respawn` - Rejoin after elimination (3h cooldown)\n"
+            "`/respawn` - Rejoin after elimination (2h cooldown)\n"
             "`/gamehub` - Manage/view land, launch missiles\n"
             "`/smartbuild` - Bulk-build cities/ports, or auto-refill SAMs\n"
             "`/attack` - Attack a player\n"
@@ -3372,6 +3321,12 @@ class ClanJoinConfirmView(discord.ui.View):
             await interaction.response.edit_message(content="You're already in a clan.", embed=None, view=None)
             return
 
+        if len(clan.get("members", [])) >= CLAN_MAX_MEMBERS:
+            await interaction.response.edit_message(
+                content=f"[{self.tag}] is full ({CLAN_MAX_MEMBERS} member cap).", embed=None, view=None
+            )
+            return
+
         clan.setdefault("members", []).append(str(self.user_id))
         save_data(data)
         await interaction.response.edit_message(content=f"✅ You joined [{self.tag}]!", embed=None, view=None)
@@ -3384,6 +3339,12 @@ class ClanJoinConfirmView(discord.ui.View):
         existing_tag, _ = find_clan_for_user(self.user_id)
         if existing_tag is not None:
             await interaction.response.edit_message(content="You're already in a clan.", embed=None, view=None)
+            return
+
+        if len(clan.get("members", [])) >= CLAN_MAX_MEMBERS:
+            await interaction.response.edit_message(
+                content=f"[{self.tag}] is full ({CLAN_MAX_MEMBERS} member cap).", embed=None, view=None
+            )
             return
 
         pending = clan.setdefault("pending_invites", [])
@@ -3437,6 +3398,14 @@ class ClanInviteDecisionView(discord.ui.View):
         if existing_tag is not None:
             save_data(data)
             await interaction.response.edit_message(content=f"<@{uid}> already joined another clan.", embed=None, view=None)
+            return
+
+        if len(clan.get("members", [])) >= CLAN_MAX_MEMBERS:
+            save_data(data)
+            await interaction.response.edit_message(
+                content=f"[{self.tag}] is now full ({CLAN_MAX_MEMBERS} member cap), you can't accept anyone else.",
+                embed=None, view=None
+            )
             return
 
         clan.setdefault("members", []).append(uid)
@@ -3688,108 +3657,6 @@ class ClanWithdrawModal(discord.ui.Modal, title="Withdraw Troops"):
         await interaction.response.edit_message(embed=embed, view=view)
 
 
-class TroopJarDepositModal(discord.ui.Modal, title="Deposit to Troop Jar"):
-    amount_input = discord.ui.TextInput(label="Amount to deposit", placeholder="e.g. 500")
-
-    def __init__(self, guild_id, user_id, tag):
-        super().__init__()
-        self.guild_id = guild_id
-        self.user_id = user_id
-        self.tag = tag
-
-    async def on_submit(self, interaction: discord.Interaction):
-        amount = await parse_amount(interaction, self.amount_input.value.strip())
-        if amount is None:
-            return
-
-        clan = get_clan(self.tag)
-        if not in_clan(clan, self.user_id):
-            await interaction.response.send_message("You're not in that clan anymore.", ephemeral=True)
-            return
-
-        if data.get("clan_games_winner"):
-            await interaction.response.send_message(
-                f"The Clan Games have already been won by [{data['clan_games_winner']}].", ephemeral=True
-            )
-            return
-
-        player = get_player(self.guild_id, self.user_id)
-        if not is_active_player(player):
-            await interaction.response.send_message(
-                "You need to be an active player in this server to deposit troops here.", ephemeral=True
-            )
-            return
-
-        if player["troops"] < amount:
-            await interaction.response.send_message(f"You only have {player['troops']:,} troops.", ephemeral=True)
-            return
-
-        current_jar = clan.get("troop_jar", 0)
-        room = TROOP_JAR_CAP - current_jar
-        if amount > room:
-            await interaction.response.send_message(
-                f"The jar only has room for {room:,} more troops (cap {TROOP_JAR_CAP:,}).", ephemeral=True
-            )
-            return
-
-        player["troops"] -= amount
-        clan["troop_jar"] = current_jar + amount
-        contributions = clan.setdefault("troop_jar_contributions", {})
-        contributions[str(self.user_id)] = contributions.get(str(self.user_id), 0) + amount
-        save_data(data)
-
-        just_won = False
-        if clan["troop_jar"] >= TROOP_JAR_CAP and not data.get("clan_games_winner"):
-            data["clan_games_winner"] = self.tag
-            save_data(data)
-            complete_clan_games(self.tag)
-            just_won = True
-
-        embed = make_clan_games_embed(self.tag, clan)
-        view = ClanGamesView(self.guild_id, self.user_id, self.tag)
-        await interaction.response.edit_message(embed=embed, view=view)
-
-        if just_won:
-            await notify_dev_clan_games(self.tag)
-
-
-class ClanGamesView(discord.ui.View):
-    def __init__(self, guild_id, user_id, tag):
-        super().__init__(timeout=120)
-        self.guild_id = guild_id
-        self.user_id = user_id
-        self.tag = tag
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("This isn't your clan hub lil bro.", ephemeral=True)
-            return False
-        return True
-
-    @discord.ui.button(label="Deposit Troops", style=discord.ButtonStyle.success, emoji="🏺")
-    async def deposit_clicked(self, interaction: discord.Interaction, button: discord.ui.Button):
-        clan = get_clan(self.tag)
-        if not in_clan(clan, self.user_id):
-            await interaction.response.edit_message(content="You're not in that clan anymore.", embed=None, view=None)
-            return
-        if data.get("clan_games_winner"):
-            await interaction.response.send_message(
-                f"The Clan Games have already been won by [{data['clan_games_winner']}].", ephemeral=True
-            )
-            return
-        await interaction.response.send_modal(TroopJarDepositModal(self.guild_id, self.user_id, self.tag))
-
-    @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary)
-    async def back_clicked(self, interaction: discord.Interaction, button: discord.ui.Button):
-        clan = get_clan(self.tag)
-        if not in_clan(clan, self.user_id):
-            await interaction.response.edit_message(content="You're not in that clan anymore.", embed=None, view=None)
-            return
-        embed, page, total_pages = make_clan_hub_embed(self.guild_id, self.tag, clan)
-        view = ClanHubView(self.guild_id, self.user_id, self.tag, page)
-        await interaction.response.edit_message(embed=embed, view=view)
-
-
 class ClanLeaveConfirmView(discord.ui.View):
     def __init__(self, guild_id, user_id, tag, page=0):
         super().__init__(timeout=60)
@@ -3989,6 +3856,56 @@ class ClanWarView(discord.ui.View):
         await interaction.response.edit_message(embed=embed, view=view)
 
 
+class TransferLeaderSelectView(discord.ui.View):
+    def __init__(self, guild_id, user_id, tag, page=0):
+        super().__init__(timeout=60)
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.tag = tag
+        self.page = page
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your clan hub lil bro.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.select(cls=discord.ui.UserSelect, placeholder="Choose the new leader", min_values=1, max_values=1)
+    async def pick_new_leader(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
+        clan = get_clan(self.tag)
+        if clan is None or str(clan.get("leader_id")) != str(self.user_id):
+            await interaction.response.edit_message(content="You're not the leader of that clan anymore.", view=None)
+            return
+
+        target = select.values[0]
+        if str(target.id) not in clan.get("members", []):
+            await interaction.response.edit_message(content=f"{target.display_name} isn't a member of [{self.tag}].", view=None)
+            return
+        if target.id == self.user_id:
+            await interaction.response.edit_message(content="You're already the leader.", view=None)
+            return
+
+        clan["leader_id"] = str(target.id)
+        save_data(data)
+
+        embed, page, total_pages = make_clan_hub_embed(self.guild_id, self.tag, clan, self.page)
+        view = ClanHubView(self.guild_id, self.user_id, self.tag, page)
+        await interaction.response.edit_message(
+            content=f"👑 Leadership of [{self.tag}] has been transferred to {target.mention}.",
+            embed=embed, view=view
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.grey)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        clan = get_clan(self.tag)
+        if not in_clan(clan, self.user_id):
+            await interaction.response.edit_message(content="You're not in that clan anymore.", embed=None, view=None)
+            return
+        embed, page, total_pages = make_clan_hub_embed(self.guild_id, self.tag, clan, self.page)
+        view = ClanHubView(self.guild_id, self.user_id, self.tag, page)
+        await interaction.response.edit_message(content=None, embed=embed, view=view)
+
+
 class ClanHubView(discord.ui.View):
     def __init__(self, guild_id, user_id, tag, page=0):
         super().__init__(timeout=180)
@@ -3996,6 +3913,22 @@ class ClanHubView(discord.ui.View):
         self.user_id = user_id
         self.tag = tag
         self.page = page
+
+        clan = get_clan(tag)
+        if clan is not None and str(clan.get("leader_id")) == str(user_id):
+            transfer_btn = discord.ui.Button(label="Transfer Leader", style=discord.ButtonStyle.primary, emoji="👑", row=0)
+            transfer_btn.callback = self.transfer_leader_clicked
+            self.add_item(transfer_btn)
+
+    async def transfer_leader_clicked(self, interaction: discord.Interaction):
+        clan = get_clan(self.tag)
+        if clan is None or str(clan.get("leader_id")) != str(self.user_id):
+            await interaction.response.edit_message(content="You're not the leader of that clan anymore.", embed=None, view=None)
+            return
+        view = TransferLeaderSelectView(self.guild_id, self.user_id, self.tag, self.page)
+        await interaction.response.edit_message(
+            content=f"Who should take over as leader of [{self.tag}]?", embed=None, view=view
+        )
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.user_id:
@@ -4038,15 +3971,6 @@ class ClanHubView(discord.ui.View):
             return
         embed = make_clan_war_embed(self.tag, clan)
         view = ClanWarView(self.guild_id, self.user_id, self.tag)
-        await interaction.response.edit_message(embed=embed, view=view)
-
-    @discord.ui.button(label="Clan Games", style=discord.ButtonStyle.primary, emoji="🏺", row=0)
-    async def clan_games_clicked(self, interaction: discord.Interaction, button: discord.ui.Button):
-        clan = await self.member_clan(interaction)
-        if clan is None:
-            return
-        embed = make_clan_games_embed(self.tag, clan)
-        view = ClanGamesView(self.guild_id, self.user_id, self.tag)
         await interaction.response.edit_message(embed=embed, view=view)
 
     @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary, row=1)
