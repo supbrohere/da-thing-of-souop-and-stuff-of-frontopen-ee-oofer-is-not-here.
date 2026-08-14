@@ -70,7 +70,7 @@ SAM_MAX_LEVEL = 6
 SAM_INTERCEPTOR_PRICE = 20000
 SAM_COOLDOWN_SECONDS = 2 * 3600
 STREAK_DAY_BOUNDARY_UTC_SECONDS = 22 * 3600
-STREAK_BONUS_GOLD = 35000
+STREAK_BONUS_GOLD = 40000
 RESPAWN_COOLDOWN_SECONDS = 2 * 3600
 CLAN_MAX_MEMBERS = 10
 DATA_FILE = "game_data.json"
@@ -535,6 +535,15 @@ def break_alliance(guild_id, user_a_id, user_b_id):
         player_a.get("alliances", {}).pop(str(user_b_id), None)
     if player_b is not None:
         player_b.get("alliances", {}).pop(str(user_a_id), None)
+
+
+def sever_all_alliances(guild_id, user_id):
+    players = get_guild_players(guild_id)
+    uid = str(user_id)
+    for other in players.values():
+        other.get("alliances", {}).pop(uid, None)
+
+
 def is_betrayer(player, now=None):
     if now is None:
         now = time.time()
@@ -639,11 +648,11 @@ def get_streak_reward_label(day_number):
     if day_number == 2:
         return "a free Missile Silo"
     if day_number == 3:
-        return "10,000 gold"
+        return "20,000 gold"
     if day_number == 4:
         return "6-hour +50% attack damage buff"
     if day_number == 5:
-        return "10,000 gold"
+        return "45,000 gold"
     if day_number == 6:
         return "3 free Ports"
     if day_number == 7:
@@ -657,11 +666,11 @@ def apply_streak_reward(player, day_number):
     elif day_number == 2:
         player["pending_free_silos"] = player.get("pending_free_silos", 0) + 1
     elif day_number == 3:
-        player["gold"] += 15000
+        player["gold"] += 20000
     elif day_number == 4:
         player["attack_buff_until"] = time.time() + ATTACK_BUFF_DURATION_SECONDS
     elif day_number == 5:
-        player["gold"] += 30000
+        player["gold"] += 45000
     elif day_number == 6:
         player["pending_free_ports"] = player.get("pending_free_ports", 0) + 3
     elif day_number == 7:
@@ -841,77 +850,326 @@ async def respawn(interaction: discord.Interaction):
         f"({STARTING_TROOPS} troops, cap {STARTING_TROOP_CAP}, 0 gold, 0 cities)."
     )
 
+TUTORIAL_PAGES = [
+    {
+        "title": "Getting Started",
+        "fields": [
+            (
+                "Joining",
+                "`/joingame` puts you on the board with 500 troops (cap 5,000) and 0 gold. Every 5 minutes the "
+                "game ticks: your troops regen toward your cap and your gold trickles in."
+            ),
+            (
+                "Troop Regen",
+                "Regen is fastest when your troops are far below your cap and tapers off the closer you get to "
+                "full (diminishing returns), with a small guaranteed trickle even near the top."
+            ),
+            (
+                "Gold Income",
+                "Base 20 gold/tick, +7 gold/tick per city, plus port income (ports scale with your active "
+                "alliances, see the Economy page). New players get 6 hours of spawn immunity."
+            ),
+            (
+                "The Core Loop",
+                "Use `/gamehub` (or `/smartbuild` to bulk-buy) to grow your economy with cities and ports. "
+                "From there you can turtle up with silos/SAMs, or start hitting neighbors with `/attack`."
+            ),
+        ]
+    },
+    {
+        "title": "Structures & Stacks",
+        "fields": [
+            (
+                "Cities",
+                "+1,500 troop cap and +7 gold/tick each. Prices climb the more you build, starts at 250 and "
+                "rises up to 20,000 near the top of a long ladder (39 tiers)."
+            ),
+            (
+                "Ports",
+                "Base 20 gold/tick each, boosted by your alliance count (see the Economy page for the exact "
+                "breakpoints). Prices climb from 250 up to 20,000 over 38 tiers."
+            ),
+            (
+                "Stacks",
+                "You start with 3 stacks and can buy up to 6 total (4th: 20,000g, 5th: 40,000g, 6th: 65,000g). "
+                "Each stack holds unlimited cities/ports but only **1 silo**. Attacks and single missiles hit one "
+                "stack at a time, but a MIRV hits every stack you own at once, so spreading out matters."
+            ),
+            (
+                "Silos",
+                "One per stack, max 6 total. Price rises each time you build one: 9,000 → 15,000 → 20,000 → "
+                "25,000 → 35,000 → 50,000 for your 6th. A silo is required to load and launch any missile."
+            ),
+        ]
+    },
+    {
+        "title": "Economy — Alliance Port Bonus",
+        "fields": [
+            (
+                "How It Scales",
+                "Each active alliance boosts your PORT income only (not cities). At 0 allies you get 100% "
+                "(20g/port). Each of your first 2 allies adds +20%: 1 ally = 120% (24g), 2 allies = 140% (28g)."
+            ),
+            (
+                "Diminishing Returns",
+                "From 3–6 allies it slows to +15% each: 3 = 155% (31g), 4 = 170% (34g), 5 = 185% (37g), "
+                "6 = 200% (40g). Past 6 allies it only adds +5% per ally, stacking huge alliance counts past "
+                "6 barely helps anymore."
+            ),
+            (
+                "Alliance Lifespan",
+                "Alliances last 2, 3, 4, or 5 days (your choice when forming one) and expire automatically. "
+                "If either side dies, the alliance is instantly severed on both ends, you both lose the bonus."
+            ),
+        ]
+    },
+    {
+        "title": "Attacking",
+        "fields": [
+            (
+                "The Basics",
+                "`/attack` a target, then send 15%, 30%, 50%, 75%, or 100% of your troops. Defenders lose a "
+                "random 60%–120% of the troops sent at them; attackers always lose 70%–100% of what they sent, "
+                "win or lose."
+            ),
+            (
+                "Capturing Structures",
+                "Each hit has a 30% chance to capture one of the defender's cities and a separate 30% chance for "
+                "a port. That chance jumps to 75% if the defender had fewer troops than what you sent."
+            ),
+            (
+                "Farming a Broke Target",
+                "If a target already has 0 troops, you get multiple capture rolls at the high 75% chance instead "
+                "of one — starting at 2 rolls, +1 more each consecutive hit you land on them while they're still "
+                "at 0. Repeatedly farming a broke player snowballs your captures fast."
+            ),
+            (
+                "Elimination",
+                "0 troops + 0 cities + 0 ports = eliminated. You loot 100% of their remaining gold, and every "
+                "alliance they had (on both sides) is wiped instantly. Use `/respawn` after a 2 hour cooldown."
+            ),
+        ]
+    },
+    {
+        "title": "Missiles",
+        "fields": [
+            (
+                "Loading & Firing",
+                "Build a silo, load a missile type from the launch menu in `/gamehub`, then fire at a target. "
+                "Launching at a current ally forces a betrayal confirmation and marks you a betrayer for 18 hours."
+            ),
+            (
+                "Atom Bomb — 15,000g",
+                "Destroys 50% of the structures in ONE targeted stack."
+            ),
+            (
+                "Hydrogen Bomb — 45,000g",
+                "Destroys 75% of the structures in ONE targeted stack, plus 50% of the target's total troops "
+                "(troop loss is skipped entirely if the missile gets intercepted)."
+            ),
+            (
+                "MIRV — 4,999,999g",
+                "The doomsday weapon. No stack-picking, it hits **every stack** the target owns at once. Each "
+                "stack that isn't intercepted takes 40% structure destruction and 20% of the target's total "
+                "troops. Extremely expensive, extremely devastating if it lands clean."
+            ),
+        ]
+    },
+    {
+        "title": "SAM Defense",
+        "fields": [
+            (
+                "Building a SAM",
+                "Any stack can build its own SAM, up to level 6 (20,000 → 45,000 → 80,000 → 130,000 → 190,000 → "
+                "260,000g per level). A SAM needs loaded stock to fire, interceptors cost 20,000g each, and "
+                "there's no hard cap on how many you can stockpile."
+            ),
+            (
+                "Stopping Atom/Hydrogen Bombs",
+                "Any SAM with stock loaded and not on cooldown intercepts a normal missile in a single shot, "
+                "fully blocking the strike on that stack."
+            ),
+            (
+                "Stopping a MIRV — Technical",
+                "A MIRV needs **3 successful interceptor shots** against a single stack to be stopped there. "
+                "Critically, your SAM's LEVEL caps how many shots it can fire per cooldown cycle, no matter how "
+                "much stock is loaded, a level 1 SAM can only ever fire once before going on cooldown, a level "
+                "2 SAM twice. That means anything under **level 3** can mathematically never stop a MIRV, even "
+                "with unlimited interceptors stockpiled. You need level 3+ on a stack for it to matter against one."
+            ),
+            (
+                "Cooldowns",
+                "A SAM goes on a 2-hour cooldown once it either uses up all its level-capped shots for that cycle "
+                "or runs out of stock. Silos also have their own separate 2-hour cooldown after firing."
+            ),
+        ]
+    },
+    {
+        "title": "Alliances, Betrayal & Immunity",
+        "fields": [
+            (
+                "Forming an Alliance",
+                "From `/gamehub`, ally with another active player and pick a duration (2–5 days). Alliances "
+                "boost your port income (see the Economy page) and can be broken at any time."
+            ),
+            (
+                "Betrayal",
+                "Breaking an alliance specifically to attack or nuke that person flags you a **betrayer** for "
+                "18 hours. During that window, anyone who attacks YOU deals 1.5x normal damage, the surprise "
+                "hit costs you afterward, so time it carefully."
+            ),
+            (
+                "Death Cleans Up Alliances",
+                "When a player is eliminated, every alliance they had is automatically removed from both sides, "
+                "their old allies lose that alliance's port bonus too, not just the eliminated player."
+            ),
+            (
+                "Spawn Immunity",
+                "New joins and fresh respawns get 6 hours of immunity from being attacked. Taking any offensive "
+                "action yourself (attacking or launching a missile) immediately cancels your own immunity."
+            ),
+        ]
+    },
+    {
+        "title": "Clans",
+        "fields": [
+            (
+                "Creating & Joining",
+                "`/clancenter` is your hub. Creating a clan is free, just pick a unique 2–10 character tag and "
+                "a short description. Clans can be public (instant join) or invite-only (leader approves DM "
+                "requests). Max 10 members per clan."
+            ),
+            (
+                "Clan Bank",
+                "Members can deposit/withdraw troops to a shared bank, capped at 40,000 troops per server (banks "
+                "are per-server, not global)."
+            ),
+            (
+                "Clan Wars",
+                "Leaders declare war on another clan, this instantly breaks any alliances between the two "
+                "clans' members. Members earn war points by attacking (5), landing missile hits (10), and "
+                "eliminating (+25 bonus) enemy clan members. First clan to 100 points wins, every member gets "
+                "70,000 gold."
+            ),
+            (
+                "Leadership",
+                "The clan leader can transfer leadership to any other member at any time from the clan hub."
+            ),
+        ]
+    },
+    {
+        "title": "Streaks, Respawn & Commands",
+        "fields": [
+            (
+                "Daily Streaks",
+                "Play daily to build a streak (skipping a day resets it). Claim rewards with `/streakrewards`: "
+                "Day 1: 5,000g. Day 2: a free silo. Day 3: 15,000g. Day 4: a 6-hour +50% attack damage buff. "
+                "Day 5: 30,000g. Day 6: 3 free ports. Day 7: a full troop refill. Day 8 onward: 40,000g every day."
+            ),
+            (
+                "Respawning",
+                "`/respawn` after elimination has a 2 hour cooldown, then puts you back at 500 troops (cap "
+                "5,000), 0 gold/cities/ports, with a fresh 6-hour immunity window."
+            ),
+            (
+                "Other Commands",
+                "`/ping` — check bot latency. `/leaderboard` — ranked by current troops. `/smartbuild` — bulk-buy "
+                "cities/ports or auto-refill every SAM you own in one go. `/gamehub [member]`, manage your own "
+                "base, or view someone else's read-only."
+            ),
+        ]
+    },
+    {
+        "title": "Advanced Notes",
+        "fields": [
+            (
+                "Don't Stack Everything",
+                "One missile only hits one stack, but a MIRV hits ALL of them. Spreading silos and SAMs across "
+                "multiple stacks protects you differently from each threat; an all in one stack is vulnerable to both."
+            ),
+            (
+                "SAM Level Is Everything vs MIRV",
+                "Level 3+ SAMs are the real MIRV counter. Loading tons of interceptors onto a level 1 or 2 SAM "
+                "does nothing against a MIRV specifically, it physically can't fire enough shots per cycle."
+            ),
+            (
+                "Alliance Count Sweet Spot",
+                "Port income from alliances barely grows past 6 allies (+5% each after that vs +15-20% before). "
+                "Don't over-invest in allying purely for gold once you're past 6."
+            ),
+            (
+                "Farming Streaks",
+                "A target sitting at 0 troops with no defense is a snowball, each consecutive hit while they "
+                "stay at 0 troops raises your capture-roll count, so repeated attacks compound fast."
+            ),
+            (
+                "Betrayal Timing",
+                "A betrayal nuke gets you the element of surprise, but you're marked for 18 hours afterward and "
+                "take 1.5x damage from anyone. Only do it when you can follow through immediately, since you're "
+                "exposed right after."
+            ),
+            (
+                "Coordinate Before War",
+                "Declaring a clan war auto-breaks alliances between the two clans' members, check who you're "
+                "allied with before your leader declares, or you could lose a port-income partner overnight."
+            ),
+            (
+                "Ticks Are Fixed",
+                "Gold and troop regen both tick together every 5 minutes. Building right before a tick doesn't "
+                "get you anything extra — only your totals at the moment of the tick matter."
+            ),
+        ]
+    },
+]
+
+
+def make_tutorial_embed(page):
+    page_data = TUTORIAL_PAGES[page]
+    embed = discord.Embed(title=f"How to Play da game: {page_data['title']}", color=0xFFFF00)
+    for name, value in page_data["fields"]:
+        embed.add_field(name=name, value=value, inline=False)
+    embed.set_footer(text=f"Page {page + 1}/{len(TUTORIAL_PAGES)} • Questions? Ping an Admin in the MOON server.")
+    return embed
+
+
+class TutorialView(discord.ui.View):
+    def __init__(self, user_id, page=0):
+        super().__init__(timeout=300)
+        self.user_id = user_id
+        self.page = page
+        self.update_buttons()
+
+    def update_buttons(self):
+        self.clear_items()
+        prev_btn = discord.ui.Button(label="◀ Prev", style=discord.ButtonStyle.secondary, disabled=self.page <= 0)
+        prev_btn.callback = self.prev_clicked
+        next_btn = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.secondary, disabled=self.page >= len(TUTORIAL_PAGES) - 1)
+        next_btn.callback = self.next_clicked
+        self.add_item(prev_btn)
+        self.add_item(next_btn)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("Run `/help` yourself to flip through this.", ephemeral=True)
+            return False
+        return True
+
+    async def prev_clicked(self, interaction: discord.Interaction):
+        self.page = max(0, self.page - 1)
+        self.update_buttons()
+        await interaction.response.edit_message(embed=make_tutorial_embed(self.page), view=self)
+
+    async def next_clicked(self, interaction: discord.Interaction):
+        self.page = min(len(TUTORIAL_PAGES) - 1, self.page + 1)
+        self.update_buttons()
+        await interaction.response.edit_message(embed=make_tutorial_embed(self.page), view=self)
+
+
 @bot.tree.command(name="help", description="How to use the bot")
 async def help_command(interaction: discord.Interaction):
-    embed = discord.Embed(title="How to Play", color=0xFFFF00)
-    embed.add_field(
-        name="Getting Started",
-        value=(
-            "`/joingame` joins the leaderboard, unlocks all commands, starts you with a 5,000 troop capacity.\n"
-            "Wait for gold to accumulate, then buy a city or port with `/gamehub` (build menu)."
-        ),
-        inline=False
-    )
-    embed.add_field(
-        name="Structures",
-        value=(
-            "**Cities** - raises your troop capacity and generate extra gold per tick.\n"
-            "**Ports** - adds +20 base gold per port. Each alliance you have adds +20% on top of that "
-            "base 20 (e.g., 1 alliance = 24 gold/port). Scales fast with more ports."
-        ),
-        inline=False
-    )
-    embed.add_field(
-        name="Stacks",
-        value=(
-            "You start with 3 stacks; buying more costs increasingly more gold (max 6). Each stack holds "
-            "an unlimited amount of structures, with an exception of silos (1 per stack). "
-            "*NOTE: Putting everything in one stack makes it an easy bombing target.*"
-        ),
-        inline=False
-    )
-    embed.add_field(
-        name="Launching Missiles",
-        value=(
-            "Use the launch button in `/gamehub` to fire from a silo (If empty, you'll be prompted to buy a missile).\n"
-            "Two missile types exist, both need a silo: **Atom Bomb** (15,000 gold) destroys 50% of structures "
-            "in the targeted stack. **Hydrogen Bomb** (45,000 gold) destroys 75% of structures in the targeted "
-            "stack and 50% of the target's total troops (skipped if intercepted).\n"
-            "**Missiles** can only be loaded via the launch menu, not the build menu.\n"
-            "Launching at an ally will trigger a **betrayal warning** (confirm/cancel) and applies the same "
-            "18-hour betrayal effect as attacking them."
-        ),
-        inline=False
-    )
-    embed.add_field(
-        name="Attacking",
-        value=(
-            "`/attack` allows you to attack someone. First you pick a target, then how much troops to send: "
-            "**15%**, **30%**, **50%**, **75%**, or **100%** (all in). Each attack has a chance to destroy a structure on hit.\n"
-            "Your target gets a DM with troops sent/lost. Losses are randomized: defenders can lose **60**-**120%** "
-            "*(relative to attacker's sent troops);* attackers lose **70**-**100%** of their own.\n"
-            "No structures + no troops = **eliminated**. Use `/respawn` after a 3 hour cooldown to rejoin."
-        ),
-        inline=False
-    )
-    embed.add_field(
-        name="Commands",
-        value=(
-            "`/joingame` - Join the game\n"
-            "`/respawn` - Rejoin after elimination (2h cooldown)\n"
-            "`/gamehub` - Manage/view land, launch missiles\n"
-            "`/smartbuild` - Bulk-build cities/ports, or auto-refill SAMs\n"
-            "`/attack` - Attack a player\n"
-            "`/leaderboard` - Ranked by current troops"
-        ),
-        inline=False
-    )
-    embed.add_field(
-        name="Questions?",
-        value="Ping an Admin in the [MOON](https://discord.gg/NnY7e739ue) server. Admins elsewhere likely won't know the bot as we do.",
-        inline=False
-    )
-    await interaction.response.send_message(embed=embed)
+    embed = make_tutorial_embed(0)
+    view = TutorialView(interaction.user.id, 0)
+    await interaction.response.send_message(embed=embed, view=view)
 
 
 def make_hub_embed(member, player):
@@ -2249,6 +2507,7 @@ class LaunchStackPickView(discord.ui.View):
                 defender["eliminated"] = True
                 defender["eliminated_at"] = time.time()
                 defender["alliances"] = {}
+                sever_all_alliances(self.guild_id, self.defender_member.id)
                 gold_captured = defender["gold"]
                 attacker["gold"] += gold_captured
                 defender["gold"] = 0
@@ -2394,6 +2653,7 @@ async def resolve_mirv_launch(interaction, guild_id, attacker_member, defender_m
         defender["eliminated"] = True
         defender["eliminated_at"] = time.time()
         defender["alliances"] = {}
+        sever_all_alliances(guild_id, defender_member.id)
         gold_captured = defender["gold"]
         attacker["gold"] += gold_captured
         defender["gold"] = 0
@@ -2780,6 +3040,7 @@ class AttackView(discord.ui.View):
             defender["eliminated"] = True
             defender["eliminated_at"] = time.time()
             defender["alliances"] = {}
+            sever_all_alliances(self.guild_id, self.defender_member.id)
             gold_captured = defender["gold"]
             attacker["gold"] += gold_captured
             defender["gold"] = 0
@@ -3139,6 +3400,67 @@ class DevRespawnTargetSelectView(discord.ui.View):
         )
 
 
+class DevClanDeleteConfirmView(discord.ui.View):
+    def __init__(self, tag):
+        super().__init__(timeout=30)
+        self.tag = tag
+
+    @discord.ui.button(label="Yes, delete clan", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_dev(interaction):
+            await interaction.response.send_message("❌ You don't have access to this.", ephemeral=True)
+            return
+        clans = get_clans_dict()
+        clan = clans.pop(self.tag, None)
+        if clan is None:
+            await interaction.response.edit_message(content="That clan doesn't exist anymore.", view=None)
+            return
+        save_data(data)
+        member_count = len(clan.get("members", []))
+        await interaction.response.edit_message(
+            content=f"✅ [{self.tag}] has been deleted. All {member_count} member(s) are now clanless.",
+            view=None
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.grey)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="Cancelled, nothing was deleted.", view=None)
+
+
+class DevClanDeleteSelectView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
+        clans = get_clans_dict()
+        options = [
+            discord.SelectOption(label=tag, description=f"{len(clan.get('members', []))} member(s)")
+            for tag, clan in sorted(clans.items())
+        ][:25]
+        select = discord.ui.Select(
+            placeholder="Choose a clan to delete" if options else "No clans exist",
+            options=options if options else [discord.SelectOption(label="No clans exist", value="none")],
+            disabled=not options
+        )
+        select.callback = self.pick_clan
+        self.select = select
+        self.add_item(select)
+
+    async def pick_clan(self, interaction: discord.Interaction):
+        if not is_dev(interaction):
+            await interaction.response.send_message("❌ You don't have access to this.", ephemeral=True)
+            return
+        tag = self.select.values[0]
+        clan = get_clan(tag)
+        if clan is None:
+            await interaction.response.edit_message(content="That clan doesn't exist anymore.", view=None)
+            return
+        member_count = len(clan.get("members", []))
+        view = DevClanDeleteConfirmView(tag)
+        await interaction.response.edit_message(
+            content=f"⚠️ Delete [{tag}] and remove all {member_count} member(s) from it, including the leader? This can't be undone.",
+            view=view
+        )
+
+
 class DevPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=60)
@@ -3167,6 +3489,13 @@ class DevPanelView(discord.ui.View):
             await interaction.response.send_message("❌ You don't have access to this.", ephemeral=True)
             return
         await interaction.response.edit_message(content="Who do you want to revive?", view=DevRespawnTargetSelectView())
+
+    @discord.ui.button(label="Delete Clan", style=discord.ButtonStyle.success)
+    async def delete_clan(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_dev(interaction):
+            await interaction.response.send_message("❌ You don't have access to this.", ephemeral=True)
+            return
+        await interaction.response.edit_message(content="Which clan do you want to delete?", view=DevClanDeleteSelectView())
 
 
 class PanelView(discord.ui.View):
