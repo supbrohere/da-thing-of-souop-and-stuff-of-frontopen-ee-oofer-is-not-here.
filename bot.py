@@ -73,6 +73,13 @@ STREAK_DAY_BOUNDARY_UTC_SECONDS = 22 * 3600
 STREAK_BONUS_GOLD = 40000
 RESPAWN_COOLDOWN_SECONDS = 2 * 3600
 CLAN_MAX_MEMBERS = 10
+WORLD_BOSS_BASE_TROOPS = 300000
+WORLD_BOSS_MAX_DAMAGE_REDUCTION = 0.70
+WORLD_BOSS_RAGE_SCALE = 1500000
+WORLD_BOSS_REGEN_BASE_PER_TICK = 1000
+WORLD_BOSS_REGEN_RAGE_BONUS_PER_TICK = 4000
+WORLD_BOSS_REWARD_POOL_GOLD = 3000000
+WORLD_BOSS_TOP_CONTRIBUTOR_BONUS_GOLD = 300000
 DATA_FILE = "game_data.json"
 
 intents = discord.Intents.default()
@@ -114,6 +121,67 @@ def get_guild_dict(guild_id):
     if gid not in data["guilds"]:
         data["guilds"][gid] = {"players": {}}
     return data["guilds"][gid]
+
+def get_world_boss(guild_id):
+    guild_dict = get_guild_dict(guild_id)
+    return guild_dict.get("world_boss")
+
+
+def world_boss_reduction(boss):
+    return min(WORLD_BOSS_MAX_DAMAGE_REDUCTION, boss.get("total_damage_taken", 0) / WORLD_BOSS_RAGE_SCALE)
+
+
+def spawn_world_boss(guild_id):
+    guild_dict = get_guild_dict(guild_id)
+    guild_dict["world_boss"] = {
+        "active": True,
+        "troops": WORLD_BOSS_BASE_TROOPS,
+        "troop_cap": WORLD_BOSS_BASE_TROOPS,
+        "total_damage_taken": 0,
+        "contributors": {},
+        "spawned_at": time.time()
+    }
+    save_data(data)
+    return guild_dict["world_boss"]
+
+
+def tick_world_boss(guild_dict, now):
+    boss = guild_dict.get("world_boss")
+    if boss is None or not boss.get("active"):
+        return
+    reduction = world_boss_reduction(boss)
+    regen = WORLD_BOSS_REGEN_BASE_PER_TICK + round(reduction * WORLD_BOSS_REGEN_RAGE_BONUS_PER_TICK)
+    boss["troops"] = min(boss["troop_cap"], boss["troops"] + regen)
+
+
+async def defeat_world_boss(guild_id, boss):
+    guild_dict = get_guild_dict(guild_id)
+    boss["active"] = False
+    boss["defeated_at"] = time.time()
+
+    total_damage = sum(boss.get("contributors", {}).values())
+    top_uid, top_damage = None, 0
+    for uid, dmg in boss.get("contributors", {}).items():
+        if dmg > top_damage:
+            top_uid, top_damage = uid, dmg
+
+    players = guild_dict.get("players", {})
+    if total_damage > 0:
+        for uid, dmg in boss.get("contributors", {}).items():
+            p = players.get(uid)
+            if is_active_player(p):
+                share = dmg / total_damage
+                p["gold"] = p.get("gold", 0) + round(WORLD_BOSS_REWARD_POOL_GOLD * share)
+                if uid == top_uid:
+                    p["gold"] += WORLD_BOSS_TOP_CONTRIBUTOR_BONUS_GOLD
+    save_data(data)
+
+    log_embed = discord.Embed(title="👹 World Boss Defeated!", color=discord.Color.gold())
+    log_embed.add_field(name="Total Contributors", value=str(len(boss.get("contributors", {}))), inline=True)
+    log_embed.add_field(name="Reward Pool", value=f"{WORLD_BOSS_REWARD_POOL_GOLD:,} gold (split by damage dealt)", inline=True)
+    if top_uid is not None:
+        log_embed.add_field(name="Top Damage Dealer", value=f"<@{top_uid}> ({top_damage:,} damage, +{WORLD_BOSS_TOP_CONTRIBUTOR_BONUS_GOLD:,} bonus gold)", inline=False)
+    await send_action_log(guild_id, log_embed)
 
 
 async def send_action_log(guild_id, embed):
@@ -709,6 +777,8 @@ def process_ticks(now=None):
                 troops = min(troops + round(calculate_troop_regen(troops, cap)), cap)
             player["troops"] = troops
             player["gold"] += gold_regen_for(player) * ticks_passed
+        for _ in range(ticks_passed):
+            tick_world_boss(guild_data, now)
     data["last_tick"] += ticks_passed * TICK_SECONDS
     save_data(data)
     return ticks_passed
@@ -940,7 +1010,7 @@ TUTORIAL_PAGES = [
             (
                 "Farming a Broke Target",
                 "If a target already has 0 troops, you get multiple capture rolls at the high 75% chance instead "
-                "of one — starting at 2 rolls, +1 more each consecutive hit you land on them while they're still "
+                "of one starting at 2 rolls, +1 more each consecutive hit you land on them while they're still "
                 "at 0. Repeatedly farming a broke player snowballs your captures fast."
             ),
             (
@@ -2933,12 +3003,33 @@ async def leaderboard(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed)
 
 
-class AttackView(discord.ui.View):
-    def __init__(self, guild_id, attacker_member, defender_member, attacker_troops):
+def make_world_boss_embed(boss):
+    if boss is None or not boss.get("active"):
+        embed = discord.Embed(title="👹 Big ah World Boss", description="world boss is not here gng.", color=discord.Color.dark_grey())
+        return embed
+
+    reduction = world_boss_reduction(boss)
+    bar_len = 20
+    filled = round(bar_len * boss["troops"] / boss["troop_cap"]) if boss["troop_cap"] > 0 else 0
+    bar = "🟥" * filled + "⬛" * (bar_len - filled)
+
+    embed = discord.Embed(title="👹 Da World Boss", color=discord.Color.dark_red())
+    embed.add_field(name="Troops", value=f"{bar}\n{boss['troops']:,} / {boss['troop_cap']:,}", inline=False)
+    embed.add_field(name="Damage Reduction", value=f"{round(reduction * 100)}% (rises the more it's been hit)", inline=True)
+    embed.add_field(name="Contributors", value=str(len(boss.get("contributors", {}))), inline=True)
+    contributors = boss.get("contributors", {})
+    if contributors:
+        top_uid = max(contributors, key=contributors.get)
+        embed.add_field(name="Top Damage Dealer", value=f"<@{top_uid}> — {contributors[top_uid]:,} damage", inline=False)
+    embed.set_footer(text="The longer this fight drags on, the tankier and faster healing it gets. Bring friends to not get cooked lmao.")
+    return embed
+
+
+class WorldBossAttackView(discord.ui.View):
+    def __init__(self, guild_id, attacker_member, attacker_troops):
         super().__init__(timeout=60)
         self.guild_id = guild_id
         self.attacker_member = attacker_member
-        self.defender_member = defender_member
 
         for pct in ATTACK_PERCENT_OPTIONS:
             amount = round(attacker_troops * pct)
@@ -2960,10 +3051,98 @@ class AttackView(discord.ui.View):
 
     async def resolve_attack(self, interaction: discord.Interaction, percent):
         attacker = get_player(self.guild_id, self.attacker_member.id)
-        defender = get_player(self.guild_id, self.defender_member.id)
+        boss = get_world_boss(self.guild_id)
 
         if not is_active_player(attacker):
             await interaction.response.edit_message(content="You can't attack right now.", embed=None, view=None)
+            return
+        if boss is None or not boss.get("active"):
+            await interaction.response.edit_message(content="The world boss isn't alive anymore bruh.", embed=None, view=None)
+            return
+
+        attack_troops = round(attacker["troops"] * percent)
+        if attack_troops <= 0:
+            await interaction.response.edit_message(content="You don't have enough troops to send skull.", embed=None, view=None)
+            return
+
+        attacker["immune_until"] = 0
+
+        reduction = world_boss_reduction(boss)
+        raw_loss_rate = random.uniform(DEFENDER_LOSS_MIN, DEFENDER_LOSS_MAX)
+        damage_dealt = round(attack_troops * raw_loss_rate * (1 - reduction))
+        boss["troops"] = max(0, boss["troops"] - damage_dealt)
+        boss["total_damage_taken"] = boss.get("total_damage_taken", 0) + damage_dealt
+
+        contributors = boss.setdefault("contributors", {})
+        uid = str(self.attacker_member.id)
+        contributors[uid] = contributors.get(uid, 0) + damage_dealt
+
+        attacker_loss_rate = random.uniform(ATTACKER_LOSS_MIN, ATTACKER_LOSS_MAX)
+        attacker_loss = round(attack_troops * attacker_loss_rate)
+        attacker["troops"] = max(0, attacker["troops"] - attacker_loss)
+
+        defeated = boss["troops"] <= 0
+        save_data(data)
+
+        result_lines = [
+            f"You sent {attack_troops:,} troops at da world boss and dealt {damage_dealt:,} damage "
+            f"(it was resisting {round(reduction * 100)}% of incoming damage).",
+            f"You lost {attacker_loss:,} troops in the fight, fah."
+        ]
+        if defeated:
+            result_lines.append("💀 **You landed the killing hit!** Rewards are being paid out to everyone who fought it.")
+
+        await interaction.response.edit_message(content="\n".join(result_lines), embed=None, view=None)
+
+        if defeated:
+            await defeat_world_boss(self.guild_id, boss)
+
+
+@bot.tree.command(name="worldboss", description="View or attack the world boss")
+async def worldboss(interaction: discord.Interaction):
+    player = get_player(interaction.guild_id, interaction.user.id)
+    boss = get_world_boss(interaction.guild_id)
+    embed = make_world_boss_embed(boss)
+
+    if boss is None or not boss.get("active") or not is_active_player(player) or player["troops"] <= 0:
+        await interaction.response.send_message(embed=embed)
+        return
+
+    view = WorldBossAttackView(interaction.guild_id, interaction.user, player["troops"])
+    await interaction.response.send_message(embed=embed, view=view)
+
+
+class AttackView(discord.ui.View):
+    def __init__(self, guild_id, attacker_member, defender_member, attacker_troops):
+        super().__init__(timeout=60)
+        self.guild_id = guild_id
+        self.attacker_member = attacker_member
+        self.defender_member = defender_member
+
+        for pct in ATTACK_PERCENT_OPTIONS:
+            amount = round(attacker_troops * pct)
+            label = f"{ATTACK_PERCENT_LABELS[pct]} ({amount:,})"
+            btn = discord.ui.Button(label=label, style=discord.ButtonStyle.red)
+            btn.callback = self._make_callback(pct)
+            self.add_item(btn)
+
+    def _make_callback(self, pct):
+        async def callback(interaction: discord.Interaction):
+            await self.resolve_attack(interaction, pct)
+        return callback
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.attacker_member.id:
+            await interaction.response.send_message("This isn't your attack menu lil bro.", ephemeral=True)
+            return False
+        return True
+
+    async def resolve_attack(self, interaction: discord.Interaction, percent):
+        attacker = get_player(self.guild_id, self.attacker_member.id)
+        defender = get_player(self.guild_id, self.defender_member.id)
+
+        if not is_active_player(attacker):
+            await interaction.response.edit_message(content="You can't attack right now ha.", embed=None, view=None)
             return
         if not is_active_player(defender):
             await interaction.response.edit_message(content="That player is no longer a valid target.", embed=None, view=None)
@@ -2971,7 +3150,7 @@ class AttackView(discord.ui.View):
 
         attack_troops = round(attacker["troops"] * percent)
         if attack_troops <= 0:
-            await interaction.response.edit_message(content="You don't have enough troops to send.", embed=None, view=None)
+            await interaction.response.edit_message(content="You don't have enough troops to send skull.", embed=None, view=None)
             return
 
         attacker["immune_until"] = 0
@@ -3496,6 +3675,21 @@ class DevPanelView(discord.ui.View):
             await interaction.response.send_message("❌ You don't have access to this.", ephemeral=True)
             return
         await interaction.response.edit_message(content="Which clan do you want to delete?", view=DevClanDeleteSelectView())
+
+    @discord.ui.button(label="Spawn World Boss", style=discord.ButtonStyle.success)
+    async def spawn_world_boss_clicked(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_dev(interaction):
+            await interaction.response.send_message("❌ You don't have access to this.", ephemeral=True)
+            return
+        existing = get_world_boss(interaction.guild_id)
+        if existing is not None and existing.get("active"):
+            await interaction.response.edit_message(content="A world boss is already active in this server.", view=None)
+            return
+        spawn_world_boss(interaction.guild_id)
+        await interaction.response.edit_message(
+            content=f"👹 A world boss with {WORLD_BOSS_BASE_TROOPS:,} troops has spawned! Players can fight it with `/worldboss`.",
+            view=None
+        )
 
 
 class PanelView(discord.ui.View):
