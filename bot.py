@@ -6,6 +6,8 @@ import time
 import random
 import asyncio
 import signal
+import math
+import shutil
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -15,24 +17,24 @@ DEV_IDS = [
     1091868001109803080, 1271780747945967649
 ]
 
-STARTING_TROOPS = 500
-STARTING_TROOP_CAP = 5000
+STARTING_TROOPS = 1000
+STARTING_TROOP_CAP = 10000
 TROOP_REGEN_FLOOR = 1.1
-TROOP_REGEN_MULTIPLIER = 1.5
+TROOP_REGEN_MULTIPLIER = 1.2
 CITY_TROOP_CAP_BONUS = 1500
-CITY_PRICES = [250, 250, 250, 500, 500, 500, 750, 750, 750, 1000, 1000, 1250, 1500, 1500, 1500, 2000, 2000, 2000, 5000, 5000, 5000, 5000, 5000, 7000, 7000, 7000, 7000, 10000, 10000, 10000, 10000, 10000, 12500, 12500, 15000, 15000, 17500, 17500, 20000]
+CITY_PRICES = [200, 200, 200, 400, 400, 400, 600, 600, 600, 800, 800, 1000, 1200, 1200, 1200, 1600, 1600, 1600, 3000, 5000, 5000, 5000, 5000, 7000, 7000, 7000, 7000, 10000, 10000, 10000, 10000, 10000, 12500, 12500, 15000 , 15000, 17500, 17500, 20000]
 BASE_GOLD_REGEN = 20
 GOLD_REGEN_PER_CITY = 7
-PORT_PRICES = [250, 250, 250, 500, 500, 500, 1000, 1000, 1000, 1500, 2000, 2000, 2000, 3000, 3000, 3000, 4000, 4000, 4000, 5000, 5000, 5000, 7500, 7500, 7500, 7500, 7500, 10000, 10000, 10000, 10000, 10000, 10000, 10000, 15000, 15000, 15000, 20000]
+PORT_PRICES = [200, 200, 200, 400, 400, 400, 800, 800, 800, 1200, 1600, 1600, 1600, 2400, 2400, 2400, 4000, 4000, 4000, 5000, 5000, 5000, 7500, 7500, 7500, 7500, 7500, 10000, 10000, 10000, 10000, 10000, 10000, 10000, 15000, 15000, 15000, 20000]
 PORT_GOLD_REGEN_PER_PORT = 20
 STARTING_STACK_COUNT = 3
 MAX_STACK_COUNT = 6
 STACK_PRICES = [20000, 40000, 65000]
-SILO_PRICES = [9000, 15000, 20000, 25000, 35000, 50000, 50000, 50000, 100000]
+SILO_PRICES = [6000, 9000, 12500, 17500, 25000, 35000, 50000, 50000, 70000]
 MISSILE_TYPES = {
-    "atom_bomb": {"label": "Atom Bomb", "emoji": "☢️", "price": 15000, "structure_destroy_percent": 0.50, "troop_destroy_percent": 0.0},
-    "hydro_bomb": {"label": "Hydrogen Bomb", "emoji": "💥", "price": 45000, "structure_destroy_percent": 0.75, "troop_destroy_percent": 0.50},
-    "mirv": {"label": "MIRV", "emoji": "☄️", "price": 4999999, "structure_destroy_percent": 0.40, "troop_destroy_percent": 0.20},
+    "atom_bomb": {"label": "Atom Bomb", "emoji": "☢️", "price": 15000, "structure_destroy_percent": 0.40, "troop_destroy_percent": 0.02},
+    "hydro_bomb": {"label": "Hydrogen Bomb", "emoji": "💥", "price": 48000, "structure_destroy_percent": 0.75, "troop_destroy_percent": 0.35},
+    "mirv": {"label": "MIRV", "emoji": "☄️", "price": 3400000, "structure_destroy_percent": 0.35, "troop_destroy_percent": 0.15},
 }
 MIRV_INTERCEPTS_NEEDED = 3
 TICK_MINUTES = 5
@@ -72,14 +74,37 @@ SAM_COOLDOWN_SECONDS = 2 * 3600
 STREAK_DAY_BOUNDARY_UTC_SECONDS = 22 * 3600
 STREAK_BONUS_GOLD = 40000
 RESPAWN_COOLDOWN_SECONDS = 2 * 3600
-CLAN_MAX_MEMBERS = 10
-WORLD_BOSS_BASE_TROOPS = 300000
-WORLD_BOSS_MAX_DAMAGE_REDUCTION = 0.70
-WORLD_BOSS_RAGE_SCALE = 1500000
-WORLD_BOSS_REGEN_BASE_PER_TICK = 1000
-WORLD_BOSS_REGEN_RAGE_BONUS_PER_TICK = 4000
-WORLD_BOSS_REWARD_POOL_GOLD = 3000000
-WORLD_BOSS_TOP_CONTRIBUTOR_BONUS_GOLD = 300000
+CLAN_MAX_MEMBERS = 5
+CATCHUP_BOTTOM_PERCENT = 0.25
+CATCHUP_REGEN_BONUS_MULTIPLIER = 1.25
+CATCHUP_MIN_ACTIVE_PLAYERS = 3
+MODIFIER_FLASH_DISCOUNT_STRUCTURE_MULTIPLIER = 0.80
+MODIFIER_RADIOACTIVE_MISSILE_MULTIPLIER = 0.55
+MODIFIER_RADIOACTIVE_SILO_MULTIPLIER = 0.90
+MODIFIER_BLOOD_MOON_CASUALTY_MULTIPLIER = 1.35
+MODIFIER_SUGAR_RUSH_TROOP_REGEN_MULTIPLIER = 1.40
+MODIFIERS = {
+    "flash_discount": {
+        "label": "Flash Discount",
+        "emoji": "⚡",
+        "description": "20% decrease of all structure prices (cities and ports)."
+    },
+    "radioactive_turnout": {
+        "label": "Radioactive Turnout",
+        "emoji": "☢️",
+        "description": "45% decrease of all missile prices and 10% decrease of silo prices."
+    },
+    "blood_moon": {
+        "label": "Blood Moon",
+        "emoji": "🌕",
+        "description": "35% casualty bonus for the defender (attacks and missiles deal 35% more troop losses to whoever's getting hit)."
+    },
+    "sugar_rush": {
+        "label": "Sugar Rush",
+        "emoji": "🍬",
+        "description": "40% increase of troop regeneration."
+    },
+}
 DATA_FILE = "game_data.json"
 
 intents = discord.Intents.default()
@@ -91,8 +116,24 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 def load_data():
     if not os.path.exists(DATA_FILE):
         return {"guilds": {}, "last_tick": time.time(), "clans": {}}
-    with open(DATA_FILE, "r") as f:
-        loaded = json.load(f)
+    try:
+        with open(DATA_FILE, "r") as f:
+            loaded = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        backup_path = f"{DATA_FILE}.corrupted.{int(time.time())}.bak"
+        try:
+            shutil.copy(DATA_FILE, backup_path)
+            print(
+                f"WARNING: {DATA_FILE} was corrupted and couldn't be read ({e}). "
+                f"Backed up the broken file to {backup_path} and starting with fresh data. "
+                f"A dev may be able to recover data from that backup file."
+            )
+        except OSError as backup_error:
+            print(
+                f"WARNING: {DATA_FILE} was corrupted and couldn't be read ({e}), "
+                f"and backing it up also failed ({backup_error}). Starting with fresh data."
+            )
+        return {"guilds": {}, "last_tick": time.time(), "clans": {}}
     if "last_tick" not in loaded:
         loaded["last_tick"] = time.time()
     if "guilds" not in loaded:
@@ -103,8 +144,10 @@ def load_data():
 
 
 def save_data(data):
-    with open(DATA_FILE, "w") as f:
+    tmp_path = DATA_FILE + ".tmp"
+    with open(tmp_path, "w") as f:
         json.dump(data, f, indent=4)
+    os.replace(tmp_path, DATA_FILE)
 
 
 data = load_data()
@@ -122,67 +165,27 @@ def get_guild_dict(guild_id):
         data["guilds"][gid] = {"players": {}}
     return data["guilds"][gid]
 
-def get_world_boss(guild_id):
+
+def get_active_modifiers():
+    return data.setdefault("active_modifiers", {})
+
+
+def is_modifier_active(key):
+    return key in get_active_modifiers()
+
+
+def get_command_channel_ids(guild_id):
     guild_dict = get_guild_dict(guild_id)
-    return guild_dict.get("world_boss")
+    return guild_dict.setdefault("command_channel_ids", [])
 
 
-def world_boss_reduction(boss):
-    return min(WORLD_BOSS_MAX_DAMAGE_REDUCTION, boss.get("total_damage_taken", 0) / WORLD_BOSS_RAGE_SCALE)
-
-
-def spawn_world_boss(guild_id):
-    guild_dict = get_guild_dict(guild_id)
-    guild_dict["world_boss"] = {
-        "active": True,
-        "troops": WORLD_BOSS_BASE_TROOPS,
-        "troop_cap": WORLD_BOSS_BASE_TROOPS,
-        "total_damage_taken": 0,
-        "contributors": {},
-        "spawned_at": time.time()
-    }
-    save_data(data)
-    return guild_dict["world_boss"]
-
-
-def tick_world_boss(guild_dict, now):
-    boss = guild_dict.get("world_boss")
-    if boss is None or not boss.get("active"):
-        return
-    reduction = world_boss_reduction(boss)
-    regen = WORLD_BOSS_REGEN_BASE_PER_TICK + round(reduction * WORLD_BOSS_REGEN_RAGE_BONUS_PER_TICK)
-    boss["troops"] = min(boss["troop_cap"], boss["troops"] + regen)
-
-
-async def defeat_world_boss(guild_id, boss):
-    guild_dict = get_guild_dict(guild_id)
-    boss["active"] = False
-    boss["defeated_at"] = time.time()
-
-    total_damage = sum(boss.get("contributors", {}).values())
-    top_uid, top_damage = None, 0
-    for uid, dmg in boss.get("contributors", {}).items():
-        if dmg > top_damage:
-            top_uid, top_damage = uid, dmg
-
-    players = guild_dict.get("players", {})
-    if total_damage > 0:
-        for uid, dmg in boss.get("contributors", {}).items():
-            p = players.get(uid)
-            if is_active_player(p):
-                share = dmg / total_damage
-                p["gold"] = p.get("gold", 0) + round(WORLD_BOSS_REWARD_POOL_GOLD * share)
-                if uid == top_uid:
-                    p["gold"] += WORLD_BOSS_TOP_CONTRIBUTOR_BONUS_GOLD
-    save_data(data)
-
-    log_embed = discord.Embed(title="👹 World Boss Defeated!", color=discord.Color.gold())
-    log_embed.add_field(name="Total Contributors", value=str(len(boss.get("contributors", {}))), inline=True)
-    log_embed.add_field(name="Reward Pool", value=f"{WORLD_BOSS_REWARD_POOL_GOLD:,} gold (split by damage dealt)", inline=True)
-    if top_uid is not None:
-        log_embed.add_field(name="Top Damage Dealer", value=f"<@{top_uid}> ({top_damage:,} damage, +{WORLD_BOSS_TOP_CONTRIBUTOR_BONUS_GOLD:,} bonus gold)", inline=False)
-    await send_action_log(guild_id, log_embed)
-
+def is_command_channel_allowed(guild_id, channel_id, user_id):
+    if user_id in DEV_IDS:
+        return True
+    allowed = get_command_channel_ids(guild_id)
+    if not allowed:
+        return True
+    return channel_id in allowed
 
 async def send_action_log(guild_id, embed):
     guild_dict = get_guild_dict(guild_id)
@@ -461,24 +464,58 @@ def port_gold_regen_for(player, now=None):
     ports = player.get("ports", 0)
     if ports <= 0:
         return 0
-    return ports * port_earnings_per_port(player, now)
+    rate = port_earnings_per_port(player, now)
+    if ports <= 25:
+        effective = ports * 1.00
+    elif ports <= 50:
+        effective = 25 + (ports - 25) * 0.97
+    elif ports <= 75:
+        effective = 25 + 25 * 0.97 + (ports - 50) * 0.95
+    elif ports <= 100:
+        effective = 25 + 25 * 0.97 + 25 * 0.95 + (ports - 75) * 0.93
+    elif ports <= 150:
+        effective = 25 + 25 * 0.97 + 25 * 0.95 + 25 * 0.93 + (ports - 100) * 0.92
+    elif ports <= 200:
+        effective = 25 + 25 * 0.97 + 25 * 0.95 + 25 * 0.93 + 50 * 0.92 + (ports - 150) * 0.91
+    elif ports <= 300:
+        effective = 25 + 25 * 0.97 + 25 * 0.95 + 25 * 0.93 + 50 * 0.92 + 50 * 0.91 + (ports - 200) * 0.90
+    else:
+        effective = 25 + 25 * 0.97 + 25 * 0.95 + 25 * 0.93 + 50 * 0.92 + 50 * 0.91 + 100 * 0.90 + (ports - 300) * 0.90
+    return round(effective * rate)
 
 
 def gold_regen_for(player, now=None):
-    base = BASE_GOLD_REGEN + (player["cities"] * GOLD_REGEN_PER_CITY)
-    return base + port_gold_regen_for(player, now)
+    cities = player["cities"]
+    if cities <= 25:
+        city_multiplier = 1.0
+    elif cities <= 50:
+        city_multiplier = 1.1
+    elif cities <= 75:
+        city_multiplier = 1.2
+    elif cities <= 100:
+        city_multiplier = 1.3
+    elif cities <= 150:
+        city_multiplier = 1.4
+    elif cities <= 200:
+        city_multiplier = 1.5
+    else:
+        city_multiplier = 1.75
+    base = BASE_GOLD_REGEN + (cities * GOLD_REGEN_PER_CITY * city_multiplier)
+    return round(base) + port_gold_regen_for(player, now)
 
 
 def get_city_price(current_cities):
-    if current_cities < len(CITY_PRICES):
-        return CITY_PRICES[current_cities]
-    return CITY_PRICES[-1]
+    price = CITY_PRICES[current_cities] if current_cities < len(CITY_PRICES) else CITY_PRICES[-1]
+    if is_modifier_active("flash_discount"):
+        price = round(price * MODIFIER_FLASH_DISCOUNT_STRUCTURE_MULTIPLIER)
+    return price
 
 
 def get_port_price(current_ports):
-    if current_ports < len(PORT_PRICES):
-        return PORT_PRICES[current_ports]
-    return PORT_PRICES[-1]
+    price = PORT_PRICES[current_ports] if current_ports < len(PORT_PRICES) else PORT_PRICES[-1]
+    if is_modifier_active("flash_discount"):
+        price = round(price * MODIFIER_FLASH_DISCOUNT_STRUCTURE_MULTIPLIER)
+    return price
 
 
 def get_stack_price(current_stack_count):
@@ -489,9 +526,17 @@ def get_stack_price(current_stack_count):
 
 
 def get_silo_price(current_silos):
-    if current_silos < len(SILO_PRICES):
-        return SILO_PRICES[current_silos]
-    return SILO_PRICES[-1]
+    price = SILO_PRICES[current_silos] if current_silos < len(SILO_PRICES) else SILO_PRICES[-1]
+    if is_modifier_active("radioactive_turnout"):
+        price = round(price * MODIFIER_RADIOACTIVE_SILO_MULTIPLIER)
+    return price
+
+
+def get_missile_price(missile_key):
+    price = MISSILE_TYPES[missile_key]["price"]
+    if is_modifier_active("radioactive_turnout"):
+        price = round(price * MODIFIER_RADIOACTIVE_MISSILE_MULTIPLIER)
+    return price
 
 
 def ensure_grid(player):
@@ -506,6 +551,8 @@ def ensure_grid(player):
             box.setdefault("sam_cooldown_until", 0)
             box.setdefault("sam_shots_fired", 0)
         player["silos"] = sum(1 for box in grid if box.get("silo", 0) > 0)
+        player["cities"] = sum(box.get("cities", 0) for box in grid)
+        player["ports"] = sum(box.get("ports", 0) for box in grid)
         return grid
 
     if isinstance(grid, list) and len(grid) > 0:
@@ -524,6 +571,8 @@ def ensure_grid(player):
         new_grid[i]["silo"] = 1
     player["grid"] = new_grid
     player["silos"] = sum(1 for box in new_grid if box.get("silo", 0) > 0)
+    player["cities"] = total_cities
+    player["ports"] = total_ports
     return new_grid
 
 
@@ -535,8 +584,11 @@ def transfer_structure_box(attacker, defender, structure_key):
             defender["grid"][idx][structure_key] -= 1
             target_idx = idx if idx < len(attacker["grid"]) else len(attacker["grid"]) - 1
             attacker["grid"][target_idx][structure_key] += 1
-            return
-    attacker["grid"][0][structure_key] += 1
+            break
+    else:
+        attacker["grid"][0][structure_key] += 1
+    defender[structure_key] = sum(box.get(structure_key, 0) for box in defender["grid"])
+    attacker[structure_key] = sum(box.get(structure_key, 0) for box in attacker["grid"])
 
 
 def resolve_missile_strike(defender, stack_idx, missile_key):
@@ -565,7 +617,10 @@ def resolve_missile_strike(defender, stack_idx, missile_key):
 
     troops_destroyed = 0
     if info.get("troop_destroy_percent", 0) > 0:
-        troops_destroyed = round(defender["troops"] * info["troop_destroy_percent"])
+        troop_destroy_percent = info["troop_destroy_percent"]
+        if is_modifier_active("blood_moon"):
+            troop_destroy_percent *= MODIFIER_BLOOD_MOON_CASUALTY_MULTIPLIER
+        troops_destroyed = round(defender["troops"] * troop_destroy_percent)
         defender["troops"] -= troops_destroyed
 
     return cities_destroyed, ports_destroyed, silos_destroyed, troops_destroyed
@@ -593,6 +648,8 @@ def form_alliance(guild_id, user_a_id, user_b_id, days):
     player_b = get_player(guild_id, user_b_id)
     player_a.setdefault("alliances", {})[str(user_b_id)] = expiry
     player_b.setdefault("alliances", {})[str(user_a_id)] = expiry
+    record_sidequest_progress(player_a, "ally")
+    record_sidequest_progress(player_b, "ally")
     save_data(data)
 
 
@@ -747,8 +804,94 @@ def apply_streak_reward(player, day_number):
         player["gold"] += STREAK_BONUS_GOLD
 
 
-async def track_activity_for_streak(interaction: discord.Interaction) -> bool:
+SIDEQUEST_POOL = [
+    {"id": "attack_1", "type": "attack", "emoji": "⚔️", "label": "Skirmisher", "description": "Attack another player.", "target": 1, "reward": 20000},
+    {"id": "attack_3", "type": "attack", "emoji": "🗡️", "label": "Warmonger", "description": "Attack another player 3 times.", "target": 3, "reward": 60000},
+    {"id": "missile_1", "type": "missile", "emoji": "🚀", "label": "Fire in the Hole", "description": "Launch a missile at another player.", "target": 1, "reward": 22000},
+    {"id": "missile_2", "type": "missile", "emoji": "☢️", "label": "Bombs Away", "description": "Launch 2 missiles at other players.", "target": 2, "reward": 45000},
+    {"id": "build_2", "type": "build", "emoji": "🏗", "label": "Builder", "description": "Build 2 cities or ports.", "target": 2, "reward": 12000},
+    {"id": "build_5", "type": "build", "emoji": "🏙", "label": "Urban Planner", "description": "Build 5 cities or ports.", "target": 5, "reward": 23000},
+    {"id": "ally_1", "type": "ally", "emoji": "🤝", "label": "Diplomat", "description": "Form a new alliance.", "target": 1, "reward": 16000},
+]
+
+
+def get_sidequest_template(quest_id):
+    for q in SIDEQUEST_POOL:
+        if q["id"] == quest_id:
+            return q
+    return None
+
+
+def ensure_sidequests(player):
+    today = get_streak_day_index()
+    sq = player.get("sidequests")
+    if sq is not None and sq.get("day_index") == today:
+        return sq
+    chosen = random.sample(SIDEQUEST_POOL, min(3, len(SIDEQUEST_POOL)))
+    sq = {
+        "day_index": today,
+        "quests": [{"id": q["id"], "progress": 0, "claimed": False} for q in chosen]
+    }
+    player["sidequests"] = sq
+    return sq
+
+
+def record_sidequest_progress(player, quest_type, amount=1):
+    sq = ensure_sidequests(player)
+    changed = False
+    for entry in sq["quests"]:
+        if entry["claimed"]:
+            continue
+        template = get_sidequest_template(entry["id"])
+        if template is None or template["type"] != quest_type:
+            continue
+        if entry["progress"] >= template["target"]:
+            continue
+        entry["progress"] = min(template["target"], entry["progress"] + amount)
+        changed = True
+    return changed
+
+
+def make_sidequests_embed(player):
+    sq = ensure_sidequests(player)
+    embed = discord.Embed(title="📜 Daily Sidequests", color=discord.Color.gold())
+    lines = []
+    any_ready = False
+    all_claimed = True
+    for entry in sq["quests"]:
+        template = get_sidequest_template(entry["id"])
+        if template is None:
+            continue
+        progress = entry["progress"]
+        target = template["target"]
+        if entry["claimed"]:
+            status = "🎉 Claimed"
+        elif progress >= target:
+            status = "✅ Ready to claim!"
+            any_ready = True
+            all_claimed = False
+        else:
+            status = f"({progress}/{target})"
+            all_claimed = False
+        lines.append(f"{template['emoji']} **{template['label']}** — {template['description']} ({template['reward']:,}g) {status}")
+    embed.description = "\n".join(lines)
+    if all_claimed:
+        embed.set_footer(text="All done for today! New sidequests arrive after the daily reset.")
+    elif any_ready:
+        embed.set_footer(text="You've got rewards ready to claim below.")
+    else:
+        embed.set_footer(text="Keep playing to make progress. New sidequests every day.")
+    return embed
+
+
+async def global_command_gate(interaction: discord.Interaction) -> bool:
     if interaction.guild_id is not None:
+        if not is_command_channel_allowed(interaction.guild_id, interaction.channel_id, interaction.user.id):
+            await interaction.response.send_message(
+                "❌ This channel does not have command permissions. Ask an admin where bot commands are allowed.",
+                ephemeral=True
+            )
+            return False
         player = get_player(interaction.guild_id, interaction.user.id)
         if player is not None:
             update_daily_streak(player)
@@ -756,7 +899,7 @@ async def track_activity_for_streak(interaction: discord.Interaction) -> bool:
     return True
 
 
-bot.tree.interaction_check = track_activity_for_streak
+bot.tree.interaction_check = global_command_gate
 
 def process_ticks(now=None):
     if now is None:
@@ -765,20 +908,29 @@ def process_ticks(now=None):
     ticks_passed = int(elapsed // TICK_SECONDS)
     if ticks_passed <= 0:
         return 0
+    sugar_rush_multiplier = MODIFIER_SUGAR_RUSH_TROOP_REGEN_MULTIPLIER if is_modifier_active("sugar_rush") else 1.0
     for guild_id, guild_data in data["guilds"].items():
-        for user_id, player in guild_data["players"].items():
+        players = guild_data["players"]
+        active_ids = [uid for uid, p in players.items() if not p.get("eliminated")]
+        catchup_ids = set()
+        if len(active_ids) >= CATCHUP_MIN_ACTIVE_PLAYERS:
+            sorted_ids = sorted(active_ids, key=lambda uid: players[uid].get("troops", 0))
+            cutoff = max(1, math.ceil(len(sorted_ids) * CATCHUP_BOTTOM_PERCENT))
+            catchup_ids = set(sorted_ids[:cutoff])
+
+        for user_id, player in players.items():
             if player.get("eliminated"):
                 continue
-            troops = player["troops"]
+            catchup_multiplier = CATCHUP_REGEN_BONUS_MULTIPLIER if user_id in catchup_ids else 1.0
+            troops = round(player["troops"])
             cap = player["troop_cap"]
             for _ in range(ticks_passed):
                 if troops >= cap:
                     break
-                troops = min(troops + round(calculate_troop_regen(troops, cap)), cap)
+                troops = min(troops + round(calculate_troop_regen(troops, cap) * catchup_multiplier * sugar_rush_multiplier), cap)
             player["troops"] = troops
-            player["gold"] += gold_regen_for(player) * ticks_passed
-        for _ in range(ticks_passed):
-            tick_world_boss(guild_data, now)
+            gold_gain = round(gold_regen_for(player) * catchup_multiplier)
+            player["gold"] = round(player["gold"]) + gold_gain * ticks_passed
     data["last_tick"] += ticks_passed * TICK_SECONDS
     save_data(data)
     return ticks_passed
@@ -973,7 +1125,7 @@ TUTORIAL_PAGES = [
         ]
     },
     {
-        "title": "Economy — Alliance Port Bonus",
+        "title": "Economy - Alliance Port Bonus",
         "fields": [
             (
                 "How It Scales",
@@ -1029,16 +1181,16 @@ TUTORIAL_PAGES = [
                 "Launching at a current ally forces a betrayal confirmation and marks you a betrayer for 18 hours."
             ),
             (
-                "Atom Bomb — 15,000g",
+                "Atom Bomb - 15,000g",
                 "Destroys 50% of the structures in ONE targeted stack."
             ),
             (
-                "Hydrogen Bomb — 45,000g",
+                "Hydrogen Bomb - 45,000g",
                 "Destroys 75% of the structures in ONE targeted stack, plus 50% of the target's total troops "
                 "(troop loss is skipped entirely if the missile gets intercepted)."
             ),
             (
-                "MIRV — 4,999,999g",
+                "MIRV - 4,999,999g",
                 "The doomsday weapon. No stack-picking, it hits **every stack** the target owns at once. Each "
                 "stack that isn't intercepted takes 40% structure destruction and 20% of the target's total "
                 "troops. Extremely expensive, extremely devastating if it lands clean."
@@ -1060,7 +1212,7 @@ TUTORIAL_PAGES = [
                 "fully blocking the strike on that stack."
             ),
             (
-                "Stopping a MIRV — Technical",
+                "Stopping a MIRV - Technical",
                 "A MIRV needs **3 successful interceptor shots** against a single stack to be stopped there. "
                 "Critically, your SAM's LEVEL caps how many shots it can fire per cooldown cycle, no matter how "
                 "much stock is loaded, a level 1 SAM can only ever fire once before going on cooldown, a level "
@@ -1143,7 +1295,7 @@ TUTORIAL_PAGES = [
             ),
             (
                 "Other Commands",
-                "`/ping` — check bot latency. `/leaderboard` — ranked by current troops. `/smartbuild` — bulk-buy "
+                "`/ping` - check bot latency. `/leaderboard` - ranked by current troops. `/smartbuild` - bulk-buy "
                 "cities/ports or auto-refill every SAM you own in one go. `/gamehub [member]`, manage your own "
                 "base, or view someone else's read-only."
             ),
@@ -1186,7 +1338,53 @@ TUTORIAL_PAGES = [
             (
                 "Ticks Are Fixed",
                 "Gold and troop regen both tick together every 5 minutes. Building right before a tick doesn't "
-                "get you anything extra — only your totals at the moment of the tick matter."
+                "get you anything extra - only your totals at the moment of the tick matter."
+            ),
+        ]
+    },
+    {
+        "title": "Modifiers",
+        "fields": [
+            (
+                "What They Are",
+                "Every so often the devs can flip on a temporary global modifier that changes how the game "
+                "plays, affecting **everyone, in every server**, equally, at the same time. Check what's live "
+                "right now with the Modifiers button on your `/gamehub`."
+            ),
+            (
+                "⚡ Flash Discount",
+                "20% decrease of all structure prices (cities and ports)."
+            ),
+            (
+                "☢️ Radioactive Turnout",
+                "45% decrease of all missile prices and 10% decrease of silo prices."
+            ),
+            (
+                "🌕 Blood Moon",
+                "35% casualty bonus for the defender. Attacks and missiles deal 35% more troop losses to "
+                "whoever's getting hit."
+            ),
+            (
+                "🍬 Sugar Rush",
+                "40% increase of troop regeneration."
+            ),
+        ]
+    },
+    {
+        "title": "Credits",
+        "fields": [
+            (
+                "<@1091868001109803080> (Soupbro)",
+                "Creator of the game. Started the project and built most of it."
+            ),
+            (
+                "<@1271780747945967649> (alt_number3)",
+                "Admin, contributor, game dev, and game balancer. Keeps the numbers from getting too "
+                "overpowered - DM him with suggestions or bug reports."
+            ),
+            (
+                "<@772261196174065704> (oofer)",
+                "Hosts the bot, for free. Say thanks."
             ),
         ]
     },
@@ -1244,8 +1442,8 @@ async def help_command(interaction: discord.Interaction):
 
 def make_hub_embed(member, player):
     embed = discord.Embed(title=f"{member.display_name}'s land", color=discord.Color.gold())
-    embed.add_field(name="Troops", value=f"{player['troops']:,} / {player['troop_cap']:,}", inline=True)
-    embed.add_field(name="Gold", value=f"{player['gold']:,}", inline=True)
+    embed.add_field(name="Troops", value=f"{player['troops']:,.0f} / {player['troop_cap']:,.0f}", inline=True)
+    embed.add_field(name="Gold", value=f"{player['gold']:,.0f}", inline=True)
     embed.add_field(name="Cities", value=str(player["cities"]), inline=True)
 
     ports = player.get("ports", 0)
@@ -1316,7 +1514,7 @@ def make_grid_embed(member, player, editable=True):
         title=f"{member.display_name}'s Building Stacks",
         color=discord.Color.gold()
     )
-    embed.add_field(name="💰 Gold", value=f"{player['gold']:,}", inline=False)
+    embed.add_field(name="💰 Gold", value=f"{player['gold']:,.0f}", inline=False)
     for idx, box in enumerate(player["grid"]):
         if box.get("silo", 0) > 0:
             if is_silo_on_cooldown(box):
@@ -1570,6 +1768,22 @@ class AllianceHubView(discord.ui.View):
     async def betray_clicked(self, interaction: discord.Interaction):
         view = BetraySelectView(self.guild_id, self.user_id)
         await interaction.response.edit_message(content="Choose an ally to betray:", view=view)
+def make_modifiers_embed():
+    active = get_active_modifiers()
+    embed = discord.Embed(title="🧪 Active Modifiers", color=discord.Color.purple())
+    if not active:
+        embed.description = "No modifiers are currently active. Check back later!"
+        return embed
+
+    embed.description = "These are currently affecting **everyone, in every server**:"
+    for key in active:
+        info = MODIFIERS.get(key)
+        if info is None:
+            continue
+        embed.add_field(name=f"{info['emoji']} {info['label']}", value=info["description"], inline=False)
+    return embed
+
+
 class GameHubView(discord.ui.View):
     def __init__(self, guild_id, user_id):
         super().__init__(timeout=120)
@@ -1588,11 +1802,19 @@ class GameHubView(discord.ui.View):
         alliance_btn.callback = self.alliance
         self.add_item(alliance_btn)
 
+        modifiers_btn = discord.ui.Button(label="Modifiers", style=discord.ButtonStyle.secondary, emoji="🧪")
+        modifiers_btn.callback = self.modifiers
+        self.add_item(modifiers_btn)
+
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.user_id:
             await interaction.response.send_message("This isn't your hub lil bro.", ephemeral=True)
             return False
         return True
+
+    async def modifiers(self, interaction: discord.Interaction):
+        embed = make_modifiers_embed()
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     async def build(self, interaction: discord.Interaction):
         player = get_player(self.guild_id, self.user_id)
@@ -1766,7 +1988,7 @@ class GridBuildView(discord.ui.View):
             return
         if player["gold"] < price:
             await interaction.response.send_message(
-                f"Not enough gold. You need {price:,}, you have {player['gold']:,}.", ephemeral=True
+                f"Not enough gold. You need {price:,}, you have {player['gold']:,.0f}.", ephemeral=True
             )
             return
         player["gold"] -= price
@@ -1852,7 +2074,7 @@ class SamUpgradePickView(discord.ui.View):
         price = SAM_PRICES[level]
         if player["gold"] < price:
             await interaction.response.send_message(
-                f"Not enough gold. You need {price:,}, you have {player['gold']:,}.", ephemeral=True
+                f"Not enough gold. You need {price:,}, you have {player['gold']:,.0f}.", ephemeral=True
             )
             return
 
@@ -1924,7 +2146,7 @@ class SamLoadPickView(discord.ui.View):
             return
         if player["gold"] < SAM_INTERCEPTOR_PRICE:
             await interaction.response.send_message(
-                f"Not enough gold. You need {SAM_INTERCEPTOR_PRICE:,}, you have {player['gold']:,}.", ephemeral=True
+                f"Not enough gold. You need {SAM_INTERCEPTOR_PRICE:,}, you have {player['gold']:,.0f}.", ephemeral=True
             )
             return
 
@@ -2018,7 +2240,7 @@ class BuildPositionView(discord.ui.View):
 
             if player["gold"] < price:
                 await interaction.response.send_message(
-                    f"Not enough gold. You need {price:,}, you have {player['gold']:,}.", ephemeral=True
+                    f"Not enough gold. You need {price:,}, you have {player['gold']:,.0f}.", ephemeral=True
                 )
                 return
 
@@ -2031,6 +2253,8 @@ class BuildPositionView(discord.ui.View):
                 player[self.structure_key] = player.get(self.structure_key, 0) + 1
                 if self.structure_key == "cities":
                     player["troop_cap"] += CITY_TROOP_CAP_BONUS
+        if self.structure_key in ("cities", "ports", "free_port"):
+            record_sidequest_progress(player, "build")
         save_data(data)
 
         embed = make_grid_embed(interaction.user, player, editable=True)
@@ -2083,21 +2307,24 @@ class SmartBuildQuantityModal(discord.ui.Modal, title="How Many?"):
                 player["troop_cap"] += CITY_TROOP_CAP_BONUS
             built += 1
             spent += next_price
+        if built > 0:
+            record_sidequest_progress(player, "build", built)
         save_data(data)
 
         noun = "city" if self.structure_key == "cities" else "port"
         noun_plural = "cities" if self.structure_key == "cities" else "ports"
+        discount_note = " (20% off from Flash Discount)" if is_modifier_active("flash_discount") else ""
 
         if built == 0:
             await interaction.response.send_message(
-                f"Couldn't afford a single {noun} ({next_price:,} gold, you have {player['gold']:,}).", ephemeral=True
+                f"Couldn't afford a single {noun} ({next_price:,} gold{discount_note}, you have {player['gold']:,.0f}).", ephemeral=True
             )
             return
 
         display = noun if built == 1 else noun_plural
         note = "" if built == amount else f" (asked for {amount}, only had gold for {built})"
         await interaction.response.send_message(
-            f"✅ Built {built} {display} in Stack {self.stack_idx + 1} for {spent:,} gold total.{note}",
+            f"✅ Built {built} {display} in Stack {self.stack_idx + 1} for {spent:,} gold total{discount_note}.{note}",
             ephemeral=True
         )
 
@@ -2326,7 +2553,7 @@ class LaunchMissilePickView(discord.ui.View):
         self.silo_index = silo_index
 
         for key, info in MISSILE_TYPES.items():
-            btn = discord.ui.Button(label=f"{info['label']} ({info['price']:,} gold)", style=discord.ButtonStyle.danger, emoji=info["emoji"])
+            btn = discord.ui.Button(label=f"{info['label']} ({get_missile_price(key):,} gold)", style=discord.ButtonStyle.danger, emoji=info["emoji"])
             btn.callback = self._make_callback(key)
             self.add_item(btn)
 
@@ -2362,10 +2589,10 @@ class LaunchMissilePickView(discord.ui.View):
             await interaction.response.edit_message(content="That silo already has a missile loaded.", view=None)
             return
 
-        price = MISSILE_TYPES[missile_key]["price"]
+        price = get_missile_price(missile_key)
         if player["gold"] < price:
             await interaction.response.edit_message(
-                content=f"Not enough gold. You need {price:,}, you have {player['gold']:,}.", view=None
+                content=f"Not enough gold. You need {price:,}, you have {player['gold']:,.0f}.", view=None
             )
             return
 
@@ -2427,13 +2654,18 @@ class LaunchTargetSelectView(discord.ui.View):
         save_data(data)
         if str(target.id) in alliances:
             view = LaunchBetrayConfirmView(self.guild_id, interaction.user, target, self.silo_index, self.missile_key)
-            await interaction.response.edit_message(
-                content=(
+            if is_betrayer(defender):
+                content = (
+                    f"You're currently **allied** with {target.display_name}, but they're already flagged as a "
+                    f"**betrayer**. Launching a missile at them will break the alliance — since they're already "
+                    f"a betrayer, this will **not** mark you as one too."
+                )
+            else:
+                content = (
                     f"You're currently **allied** with {target.display_name}. Launching a missile at them will break "
                     f"the alliance and mark you as a betrayer (you'll take extra damage while defending)."
-                ),
-                view=view
-            )
+                )
+            await interaction.response.edit_message(content=content, view=view)
             return
 
         ensure_grid(defender)
@@ -2472,7 +2704,8 @@ class LaunchBetrayConfirmView(discord.ui.View):
             return
 
         break_alliance(self.guild_id, self.attacker_member.id, self.defender_member.id)
-        attacker["betrayer_until"] = time.time() + BETRAYAL_DURATION_SECONDS
+        if not is_betrayer(defender):
+            attacker["betrayer_until"] = time.time() + BETRAYAL_DURATION_SECONDS
         save_data(data)
 
         ensure_grid(defender)
@@ -2557,6 +2790,7 @@ class LaunchStackPickView(discord.ui.View):
         attacker["grid"][self.silo_index]["missile"] = None
         attacker["grid"][self.silo_index]["cooldown_until"] = time.time() + SILO_COOLDOWN_SECONDS
         attacker["immune_until"] = 0
+        record_sidequest_progress(attacker, "missile")
 
         intercepted = try_intercept(defender, idx)
 
@@ -2699,6 +2933,7 @@ async def resolve_mirv_launch(interaction, guild_id, attacker_member, defender_m
     attacker["grid"][silo_index]["missile"] = None
     attacker["grid"][silo_index]["cooldown_until"] = time.time() + SILO_COOLDOWN_SECONDS
     attacker["immune_until"] = 0
+    record_sidequest_progress(attacker, "missile")
 
     stack_count = len(defender["grid"])
     total_cities = total_ports = total_silos = total_troops = 0
@@ -2970,6 +3205,64 @@ async def streakrewards(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
+class SidequestsView(discord.ui.View):
+    def __init__(self, guild_id, user_id):
+        super().__init__(timeout=120)
+        self.guild_id = guild_id
+        self.user_id = user_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("Run /sidequests yourself to see and claim your own.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Claim Rewards", style=discord.ButtonStyle.success, emoji="🎁")
+    async def claim_rewards(self, interaction: discord.Interaction, button: discord.ui.Button):
+        player = get_player(self.guild_id, self.user_id)
+        if not is_active_player(player):
+            await interaction.response.edit_message(content="You can't do that rn.", embed=None, view=None)
+            return
+
+        sq = ensure_sidequests(player)
+        total_gold = 0
+        claimed_labels = []
+        for entry in sq["quests"]:
+            if entry["claimed"]:
+                continue
+            template = get_sidequest_template(entry["id"])
+            if template is None:
+                continue
+            if entry["progress"] >= template["target"]:
+                entry["claimed"] = True
+                total_gold += template["reward"]
+                claimed_labels.append(template["label"])
+
+        if total_gold == 0:
+            await interaction.response.send_message("Nothing's ready to claim yet — keep playing!", ephemeral=True)
+            return
+
+        player["gold"] += total_gold
+        save_data(data)
+
+        embed = make_sidequests_embed(player)
+        await interaction.response.edit_message(
+            content=f"✅ Claimed {', '.join(claimed_labels)} for {total_gold:,} gold total!",
+            embed=embed, view=self
+        )
+
+
+@bot.tree.command(name="sidequests", description="View and claim your daily sidequests")
+async def sidequests(interaction: discord.Interaction):
+    player = get_player(interaction.guild_id, interaction.user.id)
+    if not is_active_player(player):
+        await interaction.response.send_message("You need to /joingame first.", ephemeral=True)
+        return
+    embed = make_sidequests_embed(player)
+    view = SidequestsView(interaction.guild_id, interaction.user.id)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
 @bot.tree.command(name="leaderboard", description="See the leaderboard")
 async def leaderboard(interaction: discord.Interaction):
     await interaction.response.defer()   
@@ -2997,119 +3290,10 @@ async def leaderboard(interaction: discord.Interaction):
             name += f" [{clan_tag}]"
         if pdata.get("eliminated"):
             name += " (eliminated)"
-        lines.append(f"{rank_icon} {name} — Troops: {pdata['troops']:,}/{pdata['troop_cap']:,} | Gold: {pdata['gold']:,}")
+        lines.append(f"{rank_icon} {name} — Troops: {pdata['troops']:,.0f}/{pdata['troop_cap']:,.0f} | Gold: {pdata['gold']:,.0f}")
 
     embed = discord.Embed(title="da Leaderboard", description="\n".join(lines), color=discord.Color.blue())
     await interaction.followup.send(embed=embed)
-
-
-def make_world_boss_embed(boss):
-    if boss is None or not boss.get("active"):
-        embed = discord.Embed(title="👹 Big ah World Boss", description="world boss is not here gng.", color=discord.Color.dark_grey())
-        return embed
-
-    reduction = world_boss_reduction(boss)
-    bar_len = 20
-    filled = round(bar_len * boss["troops"] / boss["troop_cap"]) if boss["troop_cap"] > 0 else 0
-    bar = "🟥" * filled + "⬛" * (bar_len - filled)
-
-    embed = discord.Embed(title="👹 Da World Boss", color=discord.Color.dark_red())
-    embed.add_field(name="Troops", value=f"{bar}\n{boss['troops']:,} / {boss['troop_cap']:,}", inline=False)
-    embed.add_field(name="Damage Reduction", value=f"{round(reduction * 100)}% (rises the more it's been hit)", inline=True)
-    embed.add_field(name="Contributors", value=str(len(boss.get("contributors", {}))), inline=True)
-    contributors = boss.get("contributors", {})
-    if contributors:
-        top_uid = max(contributors, key=contributors.get)
-        embed.add_field(name="Top Damage Dealer", value=f"<@{top_uid}> — {contributors[top_uid]:,} damage", inline=False)
-    embed.set_footer(text="The longer this fight drags on, the tankier and faster healing it gets. Bring friends to not get cooked lmao.")
-    return embed
-
-
-class WorldBossAttackView(discord.ui.View):
-    def __init__(self, guild_id, attacker_member, attacker_troops):
-        super().__init__(timeout=60)
-        self.guild_id = guild_id
-        self.attacker_member = attacker_member
-
-        for pct in ATTACK_PERCENT_OPTIONS:
-            amount = round(attacker_troops * pct)
-            label = f"{ATTACK_PERCENT_LABELS[pct]} ({amount:,})"
-            btn = discord.ui.Button(label=label, style=discord.ButtonStyle.red)
-            btn.callback = self._make_callback(pct)
-            self.add_item(btn)
-
-    def _make_callback(self, pct):
-        async def callback(interaction: discord.Interaction):
-            await self.resolve_attack(interaction, pct)
-        return callback
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.attacker_member.id:
-            await interaction.response.send_message("This isn't your attack menu.", ephemeral=True)
-            return False
-        return True
-
-    async def resolve_attack(self, interaction: discord.Interaction, percent):
-        attacker = get_player(self.guild_id, self.attacker_member.id)
-        boss = get_world_boss(self.guild_id)
-
-        if not is_active_player(attacker):
-            await interaction.response.edit_message(content="You can't attack right now.", embed=None, view=None)
-            return
-        if boss is None or not boss.get("active"):
-            await interaction.response.edit_message(content="The world boss isn't alive anymore bruh.", embed=None, view=None)
-            return
-
-        attack_troops = round(attacker["troops"] * percent)
-        if attack_troops <= 0:
-            await interaction.response.edit_message(content="You don't have enough troops to send skull.", embed=None, view=None)
-            return
-
-        attacker["immune_until"] = 0
-
-        reduction = world_boss_reduction(boss)
-        raw_loss_rate = random.uniform(DEFENDER_LOSS_MIN, DEFENDER_LOSS_MAX)
-        damage_dealt = round(attack_troops * raw_loss_rate * (1 - reduction))
-        boss["troops"] = max(0, boss["troops"] - damage_dealt)
-        boss["total_damage_taken"] = boss.get("total_damage_taken", 0) + damage_dealt
-
-        contributors = boss.setdefault("contributors", {})
-        uid = str(self.attacker_member.id)
-        contributors[uid] = contributors.get(uid, 0) + damage_dealt
-
-        attacker_loss_rate = random.uniform(ATTACKER_LOSS_MIN, ATTACKER_LOSS_MAX)
-        attacker_loss = round(attack_troops * attacker_loss_rate)
-        attacker["troops"] = max(0, attacker["troops"] - attacker_loss)
-
-        defeated = boss["troops"] <= 0
-        save_data(data)
-
-        result_lines = [
-            f"You sent {attack_troops:,} troops at da world boss and dealt {damage_dealt:,} damage "
-            f"(it was resisting {round(reduction * 100)}% of incoming damage).",
-            f"You lost {attacker_loss:,} troops in the fight, fah."
-        ]
-        if defeated:
-            result_lines.append("💀 **You landed the killing hit!** Rewards are being paid out to everyone who fought it.")
-
-        await interaction.response.edit_message(content="\n".join(result_lines), embed=None, view=None)
-
-        if defeated:
-            await defeat_world_boss(self.guild_id, boss)
-
-
-@bot.tree.command(name="worldboss", description="View or attack the world boss")
-async def worldboss(interaction: discord.Interaction):
-    player = get_player(interaction.guild_id, interaction.user.id)
-    boss = get_world_boss(interaction.guild_id)
-    embed = make_world_boss_embed(boss)
-
-    if boss is None or not boss.get("active") or not is_active_player(player) or player["troops"] <= 0:
-        await interaction.response.send_message(embed=embed)
-        return
-
-    view = WorldBossAttackView(interaction.guild_id, interaction.user, player["troops"])
-    await interaction.response.send_message(embed=embed, view=view)
 
 
 class AttackView(discord.ui.View):
@@ -3154,6 +3338,7 @@ class AttackView(discord.ui.View):
             return
 
         attacker["immune_until"] = 0
+        record_sidequest_progress(attacker, "attack")
 
         defender_troops_before = defender["troops"]
 
@@ -3162,6 +3347,8 @@ class AttackView(discord.ui.View):
             defender_loss_rate *= BETRAYER_LOSS_MULTIPLIER
         if is_attack_buffed(attacker):
             defender_loss_rate *= ATTACK_BUFF_DAMAGE_MULTIPLIER
+        if is_modifier_active("blood_moon"):
+            defender_loss_rate *= MODIFIER_BLOOD_MOON_CASUALTY_MULTIPLIER
         troop_loss = round(attack_troops * defender_loss_rate)
         defender["troops"] = max(0, defender["troops"] - troop_loss)
 
@@ -3315,7 +3502,8 @@ class BetrayConfirmView(discord.ui.View):
             return
 
         break_alliance(self.guild_id, self.attacker_member.id, self.defender_member.id)
-        attacker["betrayer_until"] = time.time() + BETRAYAL_DURATION_SECONDS
+        if not is_betrayer(defender):
+            attacker["betrayer_until"] = time.time() + BETRAYAL_DURATION_SECONDS
         save_data(data)
 
         embed = discord.Embed(
@@ -3323,8 +3511,8 @@ class BetrayConfirmView(discord.ui.View):
             description="Choose how many troops to commit to this attack.",
             color=discord.Color.red()
         )
-        embed.add_field(name="Your troops", value=f"{attacker['troops']:,}", inline=True)
-        embed.add_field(name=f"{self.defender_member.display_name}'s troops", value=f"{defender['troops']:,}", inline=True)
+        embed.add_field(name="Your troops", value=f"{attacker['troops']:,.0f}", inline=True)
+        embed.add_field(name=f"{self.defender_member.display_name}'s troops", value=f"{defender['troops']:,.0f}", inline=True)
 
         attack_view = AttackView(self.guild_id, self.attacker_member, self.defender_member, attacker["troops"])
         await interaction.response.edit_message(
@@ -3365,14 +3553,18 @@ async def attack(interaction: discord.Interaction, target: discord.Member):
     save_data(data)
     if str(target.id) in alliances:
         view = BetrayConfirmView(interaction.guild_id, interaction.user, target)
-        await interaction.response.send_message(
-            content=(
+        if is_betrayer(defender):
+            content = (
+                f"You're currently **allied** with {target.display_name}, but they're already flagged as a "
+                f"**betrayer**. Attacking them will break the alliance — since they're already a betrayer, "
+                f"this attack will **not** mark you as one too."
+            )
+        else:
+            content = (
                 f"You're currently **allied** with {target.display_name}. Attacking them will break "
                 f"the alliance and mark you as a betrayer (you'll take 50% more damage while defending)."
-            ),
-            view=view,
-            ephemeral=True
-        )
+            )
+        await interaction.response.send_message(content=content, view=view, ephemeral=True)
         return
 
     embed = discord.Embed(
@@ -3380,8 +3572,8 @@ async def attack(interaction: discord.Interaction, target: discord.Member):
         description="Choose how many troops to commit to this attack.",
         color=discord.Color.red()
     )
-    embed.add_field(name="Your troops", value=f"{attacker['troops']:,}", inline=True)
-    embed.add_field(name=f"{target.display_name}'s troops", value=f"{defender['troops']:,}", inline=True)
+    embed.add_field(name="Your troops", value=f"{attacker['troops']:,.0f}", inline=True)
+    embed.add_field(name=f"{target.display_name}'s troops", value=f"{defender['troops']:,.0f}", inline=True)
 
     view = AttackView(interaction.guild_id, interaction.user, target, attacker["troops"])
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
@@ -3443,6 +3635,15 @@ class AdminPanelView(discord.ui.View):
             return
         await interaction.response.edit_message(content="Pick a channel for the bot status message:", view=BotStatusSelectView())
 
+    @discord.ui.button(label="Command Channels", style=discord.ButtonStyle.danger)
+    async def command_channels(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not has_admin_access(interaction):
+            await interaction.response.send_message("❌ You need Manage Server permission to use this.", ephemeral=True)
+            return
+        embed = make_command_channels_embed(interaction.guild_id)
+        view = CommandChannelsView(interaction.guild_id)
+        await interaction.response.edit_message(content="Command Channels", embed=embed, view=view)
+
 
 class DevGiveAmountModal(discord.ui.Modal, title="Amount"):
     amount = discord.ui.TextInput(label="Amount (negative to take away)", placeholder="e.g. 1000 or -500")
@@ -3472,11 +3673,11 @@ class DevGiveAmountModal(discord.ui.Modal, title="Amount"):
         if self.resource == "troops":
             player["troops"] = max(0, min(player["troops"] + amount, player["troop_cap"]))
             save_data(data)
-            await interaction.response.send_message(f"✅ {self.target.mention}'s troops are now {player['troops']:,} / {player['troop_cap']:,}.", ephemeral=True)
+            await interaction.response.send_message(f"✅ {self.target.mention}'s troops are now {player['troops']:,.0f} / {player['troop_cap']:,.0f}.", ephemeral=True)
         else:
             player["gold"] = max(0, player["gold"] + amount)
             save_data(data)
-            await interaction.response.send_message(f"✅ {self.target.mention}'s gold is now {player['gold']:,}.", ephemeral=True)
+            await interaction.response.send_message(f"✅ {self.target.mention}'s gold is now {player['gold']:,.0f}.", ephemeral=True)
 
 
 class DevGiveResourceView(discord.ui.View):
@@ -3640,6 +3841,263 @@ class DevClanDeleteSelectView(discord.ui.View):
         )
 
 
+class RemoveModifierSelectView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
+        active = get_active_modifiers()
+        options = [
+            discord.SelectOption(label=MODIFIERS[key]["label"], value=key, emoji=MODIFIERS[key]["emoji"])
+            for key in active if key in MODIFIERS
+        ]
+        select = discord.ui.Select(
+            placeholder="Choose a modifier to remove" if options else "No modifiers are active",
+            options=options if options else [discord.SelectOption(label="No modifiers are active", value="none")],
+            disabled=not options
+        )
+        select.callback = self.pick_modifier
+        self.select = select
+        self.add_item(select)
+
+    async def pick_modifier(self, interaction: discord.Interaction):
+        if not is_dev(interaction):
+            await interaction.response.send_message("❌ You don't have access to this.", ephemeral=True)
+            return
+        key = self.select.values[0]
+        active = get_active_modifiers()
+        if key not in active:
+            await interaction.response.edit_message(content="That modifier isn't active anymore.", embed=None, view=None)
+            return
+        info = MODIFIERS.get(key, {"label": key, "emoji": ""})
+        del active[key]
+        save_data(data)
+        embed = make_modifiers_embed()
+        view = ManageModifiersView()
+        await interaction.response.edit_message(
+            content=f"✅ {info['emoji']} {info['label']} has been deactivated.",
+            embed=embed, view=view
+        )
+
+    @discord.ui.button(label="Back", style=discord.ButtonStyle.grey)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_dev(interaction):
+            await interaction.response.send_message("❌ You don't have access to this.", ephemeral=True)
+            return
+        embed = make_modifiers_embed()
+        view = ManageModifiersView()
+        await interaction.response.edit_message(content="Manage Modifiers", embed=embed, view=view)
+
+
+class AddModifierSelectView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
+        active = get_active_modifiers()
+        options = [
+            discord.SelectOption(label=info["label"], value=key, emoji=info["emoji"], description=info["description"][:100])
+            for key, info in MODIFIERS.items() if key not in active
+        ]
+        select = discord.ui.Select(
+            placeholder="Choose a modifier to add" if options else "All modifiers are already active",
+            options=options if options else [discord.SelectOption(label="All modifiers are already active", value="none")],
+            disabled=not options
+        )
+        select.callback = self.pick_modifier
+        self.select = select
+        self.add_item(select)
+
+    async def pick_modifier(self, interaction: discord.Interaction):
+        if not is_dev(interaction):
+            await interaction.response.send_message("❌ You don't have access to this.", ephemeral=True)
+            return
+        key = self.select.values[0]
+        if key not in MODIFIERS:
+            await interaction.response.edit_message(content="That modifier doesn't exist anymore.", embed=None, view=None)
+            return
+        active = get_active_modifiers()
+        if key in active:
+            await interaction.response.edit_message(content="That modifier is already active.", embed=None, view=None)
+            return
+        active[key] = {"activated_at": time.time()}
+        save_data(data)
+        info = MODIFIERS[key]
+        embed = make_modifiers_embed()
+        view = ManageModifiersView()
+        await interaction.response.edit_message(
+            content=f"✅ {info['emoji']} {info['label']} is now active.",
+            embed=embed, view=view
+        )
+
+    @discord.ui.button(label="Back", style=discord.ButtonStyle.grey)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_dev(interaction):
+            await interaction.response.send_message("❌ You don't have access to this.", ephemeral=True)
+            return
+        embed = make_modifiers_embed()
+        view = ManageModifiersView()
+        await interaction.response.edit_message(content="Manage Modifiers", embed=embed, view=view)
+
+
+class ManageModifiersView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
+
+    @discord.ui.button(label="Add Modifier", style=discord.ButtonStyle.success, emoji="➕")
+    async def add_modifier(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_dev(interaction):
+            await interaction.response.send_message("❌ You don't have access to this.", ephemeral=True)
+            return
+        await interaction.response.edit_message(content="Pick a modifier to activate:", embed=None, view=AddModifierSelectView())
+
+    @discord.ui.button(label="Remove Modifier", style=discord.ButtonStyle.danger, emoji="➖")
+    async def remove_modifier(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_dev(interaction):
+            await interaction.response.send_message("❌ You don't have access to this.", ephemeral=True)
+            return
+        await interaction.response.edit_message(content="Pick a modifier to deactivate:", embed=None, view=RemoveModifierSelectView())
+
+    @discord.ui.button(label="Back", style=discord.ButtonStyle.grey)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_dev(interaction):
+            await interaction.response.send_message("❌ You don't have access to this.", ephemeral=True)
+            return
+        await interaction.response.edit_message(content="Dev Panel", embed=None, view=DevPanelView())
+
+
+def make_command_channels_embed(guild_id):
+    ids = get_command_channel_ids(guild_id)
+    guild = bot.get_guild(int(guild_id))
+    embed = discord.Embed(title="📋 Command Channels", color=discord.Color.blue())
+    if not ids:
+        embed.description = "No channels are restricted. Commands can be used **anywhere** in this server."
+        return embed
+
+    lines = []
+    for cid in ids:
+        channel = guild.get_channel(cid) if guild else None
+        lines.append(channel.mention if channel else f"Unknown channel (`{cid}`)")
+    embed.description = "Commands can only be used in:\n" + "\n".join(lines)
+    return embed
+
+
+class AddCommandChannelSelectView(discord.ui.View):
+    def __init__(self, guild_id):
+        super().__init__(timeout=60)
+        self.guild_id = guild_id
+
+    @discord.ui.select(cls=discord.ui.ChannelSelect, channel_types=[discord.ChannelType.text], placeholder="Choose a channel to allow", min_values=1, max_values=1)
+    async def pick_channel(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+        if not has_admin_access(interaction):
+            await interaction.response.send_message("❌ You need Manage Server permission to use this.", ephemeral=True)
+            return
+
+        channel = select.values[0]
+        ids = get_command_channel_ids(self.guild_id)
+        if channel.id in ids:
+            await interaction.response.edit_message(content=f"{channel.mention} is already on the list.", embed=None, view=None)
+            return
+
+        ids.append(channel.id)
+        save_data(data)
+
+        embed = make_command_channels_embed(self.guild_id)
+        view = CommandChannelsView(self.guild_id)
+        await interaction.response.edit_message(
+            content=f"✅ {channel.mention} added. Commands are now restricted to the listed channel(s).",
+            embed=embed, view=view
+        )
+
+    @discord.ui.button(label="Back", style=discord.ButtonStyle.grey)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not has_admin_access(interaction):
+            await interaction.response.send_message("❌ You need Manage Server permission to use this.", ephemeral=True)
+            return
+        embed = make_command_channels_embed(self.guild_id)
+        view = CommandChannelsView(self.guild_id)
+        await interaction.response.edit_message(content="Command Channels", embed=embed, view=view)
+
+
+class RemoveCommandChannelSelectView(discord.ui.View):
+    def __init__(self, guild_id):
+        super().__init__(timeout=60)
+        self.guild_id = guild_id
+        ids = get_command_channel_ids(guild_id)
+        guild = bot.get_guild(int(guild_id))
+        options = []
+        for cid in ids:
+            channel = guild.get_channel(cid) if guild else None
+            label = f"#{channel.name}" if channel else f"Unknown ({cid})"
+            options.append(discord.SelectOption(label=label[:100], value=str(cid)))
+        select = discord.ui.Select(
+            placeholder="Choose a channel to remove" if options else "No channels are restricted",
+            options=options if options else [discord.SelectOption(label="No channels are restricted", value="none")],
+            disabled=not options
+        )
+        select.callback = self.pick_channel
+        self.select = select
+        self.add_item(select)
+
+    async def pick_channel(self, interaction: discord.Interaction):
+        if not has_admin_access(interaction):
+            await interaction.response.send_message("❌ You need Manage Server permission to use this.", ephemeral=True)
+            return
+
+        cid = int(self.select.values[0])
+        ids = get_command_channel_ids(self.guild_id)
+        if cid not in ids:
+            await interaction.response.edit_message(content="That channel isn't on the list anymore.", embed=None, view=None)
+            return
+
+        ids.remove(cid)
+        save_data(data)
+
+        guild = bot.get_guild(int(self.guild_id))
+        channel = guild.get_channel(cid) if guild else None
+        label = channel.mention if channel else f"channel `{cid}`"
+
+        embed = make_command_channels_embed(self.guild_id)
+        view = CommandChannelsView(self.guild_id)
+        await interaction.response.edit_message(content=f"✅ {label} removed from the list.", embed=embed, view=view)
+
+    @discord.ui.button(label="Back", style=discord.ButtonStyle.grey)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not has_admin_access(interaction):
+            await interaction.response.send_message("❌ You need Manage Server permission to use this.", ephemeral=True)
+            return
+        embed = make_command_channels_embed(self.guild_id)
+        view = CommandChannelsView(self.guild_id)
+        await interaction.response.edit_message(content="Command Channels", embed=embed, view=view)
+
+
+class CommandChannelsView(discord.ui.View):
+    def __init__(self, guild_id):
+        super().__init__(timeout=60)
+        self.guild_id = guild_id
+
+    @discord.ui.button(label="Add Channel", style=discord.ButtonStyle.success, emoji="➕")
+    async def add_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not has_admin_access(interaction):
+            await interaction.response.send_message("❌ You need Manage Server permission to use this.", ephemeral=True)
+            return
+        await interaction.response.edit_message(
+            content="Pick a channel to allow commands in:", embed=None, view=AddCommandChannelSelectView(self.guild_id)
+        )
+
+    @discord.ui.button(label="Remove Channel", style=discord.ButtonStyle.danger, emoji="➖")
+    async def remove_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not has_admin_access(interaction):
+            await interaction.response.send_message("❌ You need Manage Server permission to use this.", ephemeral=True)
+            return
+        await interaction.response.edit_message(
+            content="Pick a channel to remove from the list:", embed=None, view=RemoveCommandChannelSelectView(self.guild_id)
+        )
+
+    @discord.ui.button(label="Back", style=discord.ButtonStyle.grey)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not has_admin_access(interaction):
+            await interaction.response.send_message("❌ You need Manage Server permission to use this.", ephemeral=True)
+            return
+        await interaction.response.edit_message(content="Admin Panel", embed=None, view=AdminPanelView())
+
+
 class DevPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=60)
@@ -3676,20 +4134,14 @@ class DevPanelView(discord.ui.View):
             return
         await interaction.response.edit_message(content="Which clan do you want to delete?", view=DevClanDeleteSelectView())
 
-    @discord.ui.button(label="Spawn World Boss", style=discord.ButtonStyle.success)
-    async def spawn_world_boss_clicked(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="Manage Modifiers", style=discord.ButtonStyle.success)
+    async def manage_modifiers(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_dev(interaction):
             await interaction.response.send_message("❌ You don't have access to this.", ephemeral=True)
             return
-        existing = get_world_boss(interaction.guild_id)
-        if existing is not None and existing.get("active"):
-            await interaction.response.edit_message(content="A world boss is already active in this server.", view=None)
-            return
-        spawn_world_boss(interaction.guild_id)
-        await interaction.response.edit_message(
-            content=f"👹 A world boss with {WORLD_BOSS_BASE_TROOPS:,} troops has spawned! Players can fight it with `/worldboss`.",
-            view=None
-        )
+        embed = make_modifiers_embed()
+        view = ManageModifiersView()
+        await interaction.response.edit_message(content="Manage Modifiers", embed=embed, view=view)
 
 
 class PanelView(discord.ui.View):
@@ -4109,7 +4561,7 @@ class ClanDepositModal(discord.ui.Modal, title="Deposit Troops"):
             return
 
         if player["troops"] < amount:
-            await interaction.response.send_message(f"You only have {player['troops']:,} troops.", ephemeral=True)
+            await interaction.response.send_message(f"You only have {player['troops']:,.0f} troops.", ephemeral=True)
             return
 
         current_bank = get_clan_bank(clan, self.guild_id)
@@ -4167,7 +4619,7 @@ class ClanWithdrawModal(discord.ui.Modal, title="Withdraw Troops"):
         room = player["troop_cap"] - player["troops"]
         if amount > room:
             await interaction.response.send_message(
-                f"You only have room for {room:,} more troops (troop cap {player['troop_cap']:,}).", ephemeral=True
+                f"You only have room for {room:,} more troops (troop cap {player['troop_cap']:,.0f}).", ephemeral=True
             )
             return
 
@@ -4429,6 +4881,104 @@ class TransferLeaderSelectView(discord.ui.View):
         await interaction.response.edit_message(content=None, embed=embed, view=view)
 
 
+class KickMemberSelectView(discord.ui.View):
+    def __init__(self, guild_id, user_id, tag, page=0):
+        super().__init__(timeout=60)
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.tag = tag
+        self.page = page
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your clan hub lil bro.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.select(cls=discord.ui.UserSelect, placeholder="Choose who to kick", min_values=1, max_values=1)
+    async def pick_member(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
+        clan = get_clan(self.tag)
+        if clan is None or str(clan.get("leader_id")) != str(self.user_id):
+            await interaction.response.edit_message(content="You're not the leader of that clan anymore.", view=None)
+            return
+
+        target = select.values[0]
+        if str(target.id) not in clan.get("members", []):
+            await interaction.response.edit_message(content=f"{target.display_name} isn't a member of [{self.tag}].", view=None)
+            return
+        if target.id == self.user_id:
+            await interaction.response.edit_message(
+                content="You can't kick yourself. Use Transfer Leader if you want someone else in charge, or Leave Clan.",
+                view=None
+            )
+            return
+
+        view = KickMemberConfirmView(self.guild_id, self.user_id, self.tag, target.id, target.display_name, self.page)
+        await interaction.response.edit_message(
+            content=f"Kick {target.display_name} from [{self.tag}]? They'll need a new invite (or to rejoin if public) to come back.",
+            view=view
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.grey)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        clan = get_clan(self.tag)
+        if not in_clan(clan, self.user_id):
+            await interaction.response.edit_message(content="You're not in that clan anymore.", embed=None, view=None)
+            return
+        embed, page, total_pages = make_clan_hub_embed(self.guild_id, self.tag, clan, self.page)
+        view = ClanHubView(self.guild_id, self.user_id, self.tag, page)
+        await interaction.response.edit_message(content=None, embed=embed, view=view)
+
+
+class KickMemberConfirmView(discord.ui.View):
+    def __init__(self, guild_id, user_id, tag, target_id, target_name, page=0):
+        super().__init__(timeout=30)
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.tag = tag
+        self.target_id = target_id
+        self.target_name = target_name
+        self.page = page
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your clan hub lil bro.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Yes, kick them", style=discord.ButtonStyle.danger, emoji="👢")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        clan = get_clan(self.tag)
+        if clan is None or str(clan.get("leader_id")) != str(self.user_id):
+            await interaction.response.edit_message(content="You're not the leader of that clan anymore.", embed=None, view=None)
+            return
+
+        members = clan.get("members", [])
+        if str(self.target_id) not in members:
+            await interaction.response.edit_message(content=f"{self.target_name} is already not in [{self.tag}].", embed=None, view=None)
+            return
+
+        members.remove(str(self.target_id))
+        save_data(data)
+
+        embed, page, total_pages = make_clan_hub_embed(self.guild_id, self.tag, clan, self.page)
+        view = ClanHubView(self.guild_id, self.user_id, self.tag, page)
+        await interaction.response.edit_message(
+            content=f"👢 {self.target_name} was kicked from [{self.tag}].",
+            embed=embed, view=view
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.grey)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        clan = get_clan(self.tag)
+        if not in_clan(clan, self.user_id):
+            await interaction.response.edit_message(content="You're not in that clan anymore.", embed=None, view=None)
+            return
+        embed, page, total_pages = make_clan_hub_embed(self.guild_id, self.tag, clan, self.page)
+        view = ClanHubView(self.guild_id, self.user_id, self.tag, page)
+        await interaction.response.edit_message(content=None, embed=embed, view=view)
+
+
 class ClanHubView(discord.ui.View):
     def __init__(self, guild_id, user_id, tag, page=0):
         super().__init__(timeout=180)
@@ -4443,6 +4993,10 @@ class ClanHubView(discord.ui.View):
             transfer_btn.callback = self.transfer_leader_clicked
             self.add_item(transfer_btn)
 
+            kick_btn = discord.ui.Button(label="Kick Member", style=discord.ButtonStyle.danger, emoji="👢", row=1)
+            kick_btn.callback = self.kick_member_clicked
+            self.add_item(kick_btn)
+
     async def transfer_leader_clicked(self, interaction: discord.Interaction):
         clan = get_clan(self.tag)
         if clan is None or str(clan.get("leader_id")) != str(self.user_id):
@@ -4451,6 +5005,19 @@ class ClanHubView(discord.ui.View):
         view = TransferLeaderSelectView(self.guild_id, self.user_id, self.tag, self.page)
         await interaction.response.edit_message(
             content=f"Who should take over as leader of [{self.tag}]?", embed=None, view=view
+        )
+
+    async def kick_member_clicked(self, interaction: discord.Interaction):
+        clan = get_clan(self.tag)
+        if clan is None or str(clan.get("leader_id")) != str(self.user_id):
+            await interaction.response.edit_message(content="You're not the leader of that clan anymore.", embed=None, view=None)
+            return
+        if len(clan.get("members", [])) <= 1:
+            await interaction.response.edit_message(content="There's nobody else in the clan to kick.", embed=None, view=None)
+            return
+        view = KickMemberSelectView(self.guild_id, self.user_id, self.tag, self.page)
+        await interaction.response.edit_message(
+            content=f"Who do you want to kick from [{self.tag}]?", embed=None, view=view
         )
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
